@@ -25,10 +25,13 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `candle_store.py` | Your own candle database. Saves NIFTY / SENSEX candles and India VIX into `market_data.db` so you build a long history (see section 3b). |
 | `candle_baseline.py` | Reality check: compares the strategy with random entries (same exits, costs and stop sizes) to see if it beats chance (see section 7b). |
 | `test_no_lookahead.py` | Safety test: checks that the rules never use the future. |
+| `telegram_notify.py` | Sends a short Telegram message when a new idea appears and when it ends (see section 3c). Also has the setup helpers `--check`, `--test` and `--find-chat`. |
+| `test_telegram_notify.py` | Tests the Telegram alerts with a fake Telegram, so no real bot is needed. |
+| `.env.example` | Template for your private Telegram settings. Copy it to `.env` and fill in your values (section 3c). |
 | `requirements.txt` | The packages the project needs (`pip install -r requirements.txt`). |
 | `README.md` | This document. |
 
-Files created by the tool: `trade_journal.csv` (idea history), `trade_snapshots/` (a small chart of every finished idea), `trade_memory.csv` (the memory), `market_data.db` (your saved candles), `backtest_trades.csv` (only if you use `--save`), and a `.cache` folder (only with Angel One). Do not delete `trade_journal.csv`, `trade_snapshots/`, `trade_memory.csv` and `market_data.db` if you want to keep your history, memory and candle data.
+Files created by the tool: `trade_journal.csv` (idea history), `trade_snapshots/` (a small chart of every finished idea), `trade_memory.csv` (the memory), `market_data.db` (your saved candles), `backtest_trades.csv` (only if you use `--save`), a `.cache` folder (only with Angel One), and `.env` (you create it yourself from `.env.example` for Telegram; it holds your private token and is never uploaded to Git). Do not delete `trade_journal.csv`, `trade_snapshots/`, `trade_memory.csv` and `market_data.db` if you want to keep your history, memory and candle data.
 
 The `.venv` folder (created in section 2) holds the installed packages for this project only. It can be deleted and rebuilt at any time.
 
@@ -66,11 +69,13 @@ Tip: you do not have to activate the environment. You can also run any command w
 | See what the database holds | `python candle_store.py status` |
 | Does the strategy beat random entries? | `python candle_baseline.py` |
 | Check that the rules never use the future | `python test_no_lookahead.py` |
+| Telegram: check the settings / send a test message / find the group id | `python telegram_notify.py --check` / `--test` / `--find-chat` |
+| Test the Telegram alerts (no real bot needed) | `python test_telegram_notify.py` |
 
 Stop any of them with **Ctrl + C**.
 
 ### Dashboard options
-`python dashboard.py --port 5050` (other port), `--no-browser` (do not open the browser), `--no-reload` (turn off auto-reload, see below).
+`python dashboard.py --port 5050` (other port), `--no-browser` (do not open the browser), `--no-reload` (turn off auto-reload, see below), `--no-alerts` (do not run the background Telegram alert loop, see section 3c).
 
 **Auto-reload:** you do not need to stop and start the dashboard after changing the code. When any `.py` file in the project changes, the server restarts by itself and the page open in your browser refreshes itself a moment later (it may show "Cannot reach the dashboard server" for a second or two while the server restarts). Only `.py` files trigger it; changes to this README or to the data files (`trade_journal.csv`, `market_data.db`) do not. A dashboard that was started before auto-reload existed does not have it: stop it once with Ctrl + C and start it again. Use `--no-reload` if you want the old behaviour (the server never restarts by itself).
 
@@ -129,6 +134,92 @@ vix = load_vix()
 **Daily schedule:** a Windows scheduled task named `AI-Trading-Candle-Collect` runs `candle_store.py collect` every Monday to Friday at 4:00 pm (after the market closes). If the PC was off at that time, it runs when the PC is next on and you are logged in. Run `collect` yourself at least once a week; if the PC is off for more than 7 days, those 1-minute candles are lost for good. To remove the task: `Unregister-ScheduledTask -TaskName "AI-Trading-Candle-Collect" -Confirm:$false` (PowerShell).
 
 The backtest still downloads from Yahoo by default. To test on your saved history, load it with `load_candles` and pass it to `compute_features` and `run_backtest`, or export a CSV and use `candle_backtest.py --csv`.
+
+---
+
+## 3c. Telegram alerts (optional)
+
+The dashboard can send a short message to a Telegram chat or group when a new trade idea appears, and another one when that idea ends. You do not have to watch the screen.
+
+**A new idea** (🟢 for CE, 🔴 for PE):
+
+```
+🟢 CE IDEA - NIFTY 25450 CE
+NIFTY 5m candles | confirmed at 14:05 IST
+Expiry - Mon 23 Nov
+
+BUY - ₹184.70
+STOP LOSS - ₹171.70
+TARGET - ₹212.40
+
+Per unit:
+loss - ₹13.00
+profit - ₹27.70
+```
+
+**When it ends** (✅ target hit, ❌ stop loss hit, ⏱ time exit):
+
+```
+✅ TARGET HIT - NIFTY 25450 CE
+NIFTY 5m candles | closed at 14:35 IST
+
+Profit - ₹27.70 per unit
+Held - 6 candles (30 min)
+
+BUY - ₹184.70
+TARGET - ₹212.40
+```
+
+How to read them:
+- **BUY, STOP LOSS and TARGET are option prices** (what you see in Groww), per unit. Multiply by the lot size for the total. They are ESTIMATES (or live prices with Angel One), so the real price can differ by 10 to 20%. Always check the real price in Groww before buying.
+- **`Profit - ₹27.70 per unit`** is the buy price to the target price. **`Loss - ₹13.00 per unit`** is the buy price to the stop loss price. Brokerage and taxes are not included.
+- **A time exit (⏱)** means neither the target nor the stop loss was reached and the trade was closed. Its figure says `about`, because it ended somewhere between the two prices (or `Result - break-even`).
+- **`(index)`** after a price means the option prices could not be worked out, so the index levels are shown instead.
+- **A `DELAYED DATA` line** appears when you allowed alerts on old data (see below).
+
+### When an alert is sent
+
+- Only for the idea that is on the screen **right now**, while the market is open. An idea found after the fact (it appeared while nobody was looking) is saved in the history but not sent, because it would be stale.
+- **Free Yahoo data is about 15 minutes late**, so by default NO alert is sent on old data: the entry moment has usually passed. To get alerts anyway, set `TELEGRAM_ALLOW_DELAYED=1`. Or use Angel One for live data.
+- **Each alert is sent exactly once**, also after a restart or an auto-reload (the journal remembers it in its `alerts` column). The result message is only sent for ideas that were alerted.
+- **A browser tab is not needed.** While `python dashboard.py` runs (keep the terminal open), a background loop checks NIFTY and SENSEX (5 minute candles) every 30 seconds on weekdays from 9:10 to 16:00 IST. Use `--no-alerts` to turn the loop off.
+- If Telegram is down or the token is wrong, a short note is printed in the terminal. The dashboard keeps working.
+
+### Setup (once)
+
+1. **Create the bot.** In Telegram, open **@BotFather** (the one with the blue tick), send `/newbot`, choose a name and a username that ends in `bot`. BotFather gives you a **token** like `123456789:ABC...`. Keep it secret.
+2. **Add the bot to your group.** Create a group (only you in it is best, see the cautions below), then open the group menu (⋮), choose **Add members** and add your bot.
+3. **Let the bot see the group.** In the group, send `/start@yourbotname` (use your bot's real username). Bots do not see normal messages in groups, but they do see messages that mention them.
+4. **Find the chat id.** Put the token in `.env` first (step 5), or set it in the terminal, then run `python telegram_notify.py --find-chat`. It lists the chats the bot can see. A group id is a negative number.
+5. **Create your `.env` file.** Copy `.env.example` to `.env` (in the project folder) and fill in the two values:
+
+   ```
+   TELEGRAM_BOT_TOKEN=paste-your-token-here
+   TELEGRAM_CHAT_ID=-1001234567890
+   ```
+
+   For free Yahoo data, also remove the `#` from the line `TELEGRAM_ALLOW_DELAYED=1`. Put real values only in `.env`, never in `.env.example`.
+6. **Test it.** Run `python telegram_notify.py --check` (it checks the token and shows the bot's name; the token itself is never shown), then `python telegram_notify.py --test` (it sends a test message to the chat).
+7. **Start the dashboard** with `python dashboard.py`. The first lines say `Telegram alerts: ON` (or `OFF` and what is missing).
+
+### Settings
+
+Put them in `.env` or set them in the terminal (a value set in the terminal wins over `.env`):
+
+| Setting | Meaning |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Required. From @BotFather. Anyone who has it can send messages as your bot. |
+| `TELEGRAM_CHAT_ID` | Required. The group or chat that receives the messages. |
+| `TELEGRAM_ALLOW_DELAYED` | `1` = also send alerts when the data is old. The message then starts with a `DELAYED DATA` line. Default: off. |
+| `ALERT_MARKETS` | The markets the loop watches. Default `nifty:5m,sensex:5m`. |
+| `ALERT_SOURCE` | `yahoo` (default) or `angel`. |
+
+### Cautions
+
+- **Keep the token private.** It belongs only in `.env`, which Git ignores. Do not put it in `.env.example`, in the code, in a screenshot or in a chat. If it leaks, open @BotFather, send `/revoke`, pick your bot and put the new token in `.env`.
+- **Keep the group private.** Sharing signals with other people may need SEBI registration (see section 13), and the backtest tests so far show no clear edge over simple trend-following. A group where only you read the messages avoids the problem.
+- If the group is turned into a "supergroup" (for example when many members join or it becomes public), Telegram gives it a new id that starts with `-100`. Run `--find-chat` again if the alerts stop.
+- `python test_telegram_notify.py` tests all of this with a fake Telegram on your computer. It never uses your real token or group.
 
 ---
 
@@ -356,6 +447,9 @@ The Angel One code is written but not tested on a live account yet.
 | VIX filter skipped | India VIX could not be downloaded. The rest still works. |
 | Option price says ESTIMATE with Angel One | Live option price could not be fetched. Read the `[option price] ...` message in the terminal. |
 | Angel One login failed | Check the 4 environment variables in the same terminal and the TOTP secret. |
+| No Telegram alert arrives | Check that the first lines of `python dashboard.py` say `Telegram alerts: ON`. With free Yahoo data set `TELEGRAM_ALLOW_DELAYED=1` (old data sends nothing by default). Alerts are only for the idea on screen right now, while the market is open. Run `python telegram_notify.py --check` and `--test` (section 3c). |
+| `--find-chat` shows no chat | Add the bot to the group, send `/start@yourbotname` there, then run it again. |
+| Telegram says "chat not found" | The chat id is wrong, or the bot is not in the group. Run `--find-chat` again. |
 
 ---
 
@@ -384,6 +478,55 @@ The Angel One code is written but not tested on a live account yet.
 
 - Option buying loses money quickly because of time decay. Backtest and paper trade first.
 - Decide stop loss and target BEFORE buying. Without them it is gambling.
-- Never share your API key, PIN or TOTP secret. Never put them in the code or upload them to GitHub.
+- Never share your API key, PIN or TOTP secret. Never put them in the code or upload them to GitHub. The same goes for your Telegram bot token (keep it only in `.env`).
 - For your own use only. Sharing signals with others or charging for them may need SEBI registration.
 - This is not financial advice. Any signal is for your own judgment, not a guaranteed result.
+
+---
+
+## 14. Working with Git (the `development` branch)
+
+The code is on GitHub: `https://github.com/DivyeshSapariya/candle-signal-lab`
+
+| Branch | What it is for |
+|---|---|
+| `main` | The stable version. Only changes that you have tested are merged into it. Do not work on it directly. |
+| `development` | Where all new work happens. Changes here do not touch `main` until you merge them. |
+
+### Daily workflow
+
+1. **Check you are on `development`:** `git branch --show-current` should print `development`. If not, run `git switch development`.
+2. **Change the code.** The dashboard reloads by itself (section 3), so you can see each change at once.
+3. **Test it:** `python test_no_lookahead.py` (the rules must never use the future). If you changed the rules, also run `python candle_backtest.py` and `python candle_baseline.py` and compare with before.
+4. **Save your work:**
+   ```
+   git add .
+   git commit -m "short description of the change"
+   git push
+   ```
+   `git push` sends `development` to GitHub, not `main`.
+5. **Release to `main`** when a change is tested and you are happy with it. Either:
+   - open a pull request from `development` into `main` on GitHub (`https://github.com/DivyeshSapariya/candle-signal-lab/pull/new/development`), check it and click Merge; or
+   - do it on your computer: `git switch main`, `git merge development`, `git push`, then `git switch development` to carry on working.
+6. **If `main` ever gets a change that `development` does not have,** bring it over with `git switch development` and `git merge main`.
+
+Before switching branches, commit your work first (or run `git stash`), so unfinished changes do not get mixed up.
+
+### What is in Git and what is not
+
+The file `.gitignore` keeps your personal data out of GitHub: `market_data.db` (saved candles), `trade_journal.csv`, `trade_memory.csv`, `trade_snapshots/`, `.venv/`, `__pycache__/`, `.cache/` and `.env` files (your private Telegram settings). `.env.example` is only a template with empty values, so it is committed. These files exist only on your computer, so back them up yourself if you want to keep them. Never put API keys, PINs or TOTP secrets in a file that is committed.
+
+To protect `main` from direct pushes, you can turn on branch protection in the GitHub repo under Settings, then Branches. This is optional.
+
+### Setting up on another computer
+
+```
+git clone https://github.com/DivyeshSapariya/candle-signal-lab.git
+cd candle-signal-lab
+git switch development
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe candle_store.py collect
+```
+
+The last command starts a new candle database. Your journal, memory and older candles do not come with the clone, and candles older than what Yahoo still offers (about 58 days of 5-minute candles) cannot be downloaded again. The daily scheduled collection (section 3b) also has to be set up again on that computer, and it must point at the folder you cloned into.
