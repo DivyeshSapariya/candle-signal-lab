@@ -37,7 +37,7 @@ COLUMNS = ["key", "created", "index", "interval", "side", "signal_time", "decisi
            "mode", "entry", "stop", "target", "risk", "option", "status", "fill",
            "exit_time", "exit_price", "r", "note",
            "pattern", "score", "reasons", "context", "memory", "bars", "peak_r", "dd_r", "story",
-           "option_levels"]
+           "option_levels", "alerts"]
 FINISHED = ("TARGET", "STOP", "TIME")
 LABELS = {"TARGET": "SUCCESS", "STOP": "FAILED", "TIME": "TIME EXIT", "PENDING": "WAITING",
           "OPEN": "RUNNING", "SKIPPED": "SKIPPED"}
@@ -141,11 +141,13 @@ def make_story(status: str, bars: int, peak_r: float, dd_r: float, r_gross, inte
 # Save a new idea
 # ---------------------------------------------------------------------------
 def record_idea(plan: dict, index: str, interval: str, created: str, memory: dict = None,
-                option_levels: dict = None) -> bool:
+                option_levels: dict = None, alerts: str = "") -> bool:
     """
     Save a new idea once. Returns True if it was new.
     option_levels: the option prices (buy / stop loss / target) at the moment the idea was made.
     It is saved with the idea, because the real option price cannot be found out later.
+    alerts: notes which alerts belong to this idea ("new" = a Telegram alert was sent for it, and
+    "result" is added when the alert about its result has been sent). It keeps every alert to ONE.
     """
     key = f"{index}|{interval}|{plan['signal_time']}|{plan['signal']}"
     with _lock:
@@ -166,6 +168,7 @@ def record_idea(plan: dict, index: str, interval: str, created: str, memory: dic
             "bars": "", "peak_r": "", "dd_r": "",
             "story": make_story("PENDING", 0, 0, 0, None, 5),
             "option_levels": json.dumps(option_levels) if option_levels else "",
+            "alerts": alerts,
         }
         row = {k: str(v) for k, v in row.items()}            # the journal file stores plain text
         _save(pd.concat([df, pd.DataFrame([row])], ignore_index=True))
@@ -194,9 +197,14 @@ def _write_snapshot(f: pd.DataFrame, i: int, res: dict, row) -> None:
         json.dump(snap, fh)
 
 
-def update_results(f: pd.DataFrame, index: str, interval_min: int):
-    """Check unfinished ideas against the finished candles in f (output of compute_features)."""
+def update_results(f: pd.DataFrame, index: str, interval_min: int, on_finished=None):
+    """
+    Check unfinished ideas against the finished candles in f (output of compute_features).
+    on_finished: optional function(info) called ONCE for an idea that had an alert ("new") and has
+    now ended (target / stop loss / time exit). info has the option, side, status, result in R, etc.
+    """
     new_experiences = []
+    finished_alerts = []
     with _lock:
         df = _load()
         open_rows = df[(df["index"] == index) & (df["interval"] == f"{interval_min}m")
@@ -230,6 +238,18 @@ def update_results(f: pd.DataFrame, index: str, interval_min: int):
             changed = True
 
             if res["status"] in FINISHED:
+                alerts = str(row["alerts"])
+                if on_finished is not None and "new" in alerts and "result" not in alerts:
+                    df.loc[row_id, "alerts"] = (alerts + ",result").strip(",")   # marked BEFORE sending
+                    finished_alerts.append({
+                        "key": row["key"], "index": row["index"], "interval": row["interval"],
+                        "side": row["side"], "option": row["option"], "status": res["status"],
+                        "exit_time": res["exit_time"],
+                        "r_net": res["r"] - COST_R, "r_gross": res["r"], "bars": res["bars"], "story": story,
+                        "peak_r": res["peak_r"], "dd_r": res["dd_r"],
+                        "entry": _num(row["entry"]), "stop": _num(row["stop"]), "target": _num(row["target"]),
+                        "option_levels": _json(row["option_levels"], None),
+                    })
                 try:
                     _write_snapshot(f, i, res, row)
                 except Exception as error:
@@ -244,14 +264,22 @@ def update_results(f: pd.DataFrame, index: str, interval_min: int):
             _save(df)
     if new_experiences:                      # the memory learns from every finished idea
         candle_memory.add_experiences(new_experiences)
+    for info in finished_alerts:             # sent after the lock is released
+        try:
+            on_finished(info)
+        except Exception as error:
+            print(f"[journal] result alert failed: {error}")
 
 
 def scan_today(f: pd.DataFrame, index: str, interval: str, interval_min: int,
-               today, created: str, option_levels_for=None) -> int:
+               today, created: str, option_levels_for=None, should_alert=None, on_new_idea=None) -> int:
     """
     Save every idea of TODAY's session that is not saved yet (for example ideas that appeared
     and vanished while you were not looking). Same one-trade-at-a-time rule as the backtest.
     option_levels_for: optional function(plan) -> option prices to save with a new idea.
+    should_alert: optional function(plan) -> True if a NEW idea deserves an alert (Telegram).
+    on_new_idea: optional function(plan, option_levels, memory), called once for such an idea,
+    only when it was really new (never again after a restart).
     """
     days = f["day"].values
     todays = [i for i in range(len(f)) if days[i] == today]
@@ -274,8 +302,19 @@ def scan_today(f: pd.DataFrame, index: str, interval: str, interval_min: int,
                 levels = option_levels_for(plan)
             except Exception as error:               # the journal must work without option prices
                 print(f"[journal] could not get option prices: {error}")
-        if record_idea(plan, index, interval, created, memory, levels):
+        want_alert = False
+        if should_alert is not None and on_new_idea is not None:
+            try:
+                want_alert = bool(should_alert(plan))
+            except Exception as error:
+                print(f"[journal] could not decide about the alert: {error}")
+        if record_idea(plan, index, interval, created, memory, levels, "new" if want_alert else ""):
             added += 1
+            if want_alert:
+                try:
+                    on_new_idea(plan, levels, memory)
+                except Exception as error:           # an alert problem must never stop the journal
+                    print(f"[journal] alert failed: {error}")
         res = simulate_trade(f, i, plan, interval_min)
         if res["status"] in ("OPEN", "PENDING"):
             break

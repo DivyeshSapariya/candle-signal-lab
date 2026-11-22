@@ -28,12 +28,15 @@ from flask import Flask, Response, jsonify, request
 
 import candle_journal as journal
 import candle_memory
+import telegram_notify as tg
 from candle_patterns import PATTERN_INFO
 from data_sources import IST, INTERVAL_MINUTES, drop_forming_candle, fetch_angel_option, get_candles
 from option_pricer import build_option_levels, get_vix_daily
 from candle_signals import compute_features
 from live_monitor import market_is_open
 from trade_plan import build_trade_plan
+
+tg.load_env_file()                        # optional .env file with the Telegram settings (never uploaded to Git)
 
 app = Flask(__name__)
 
@@ -159,10 +162,33 @@ def build_payload(source: str, index: str, interval: str) -> dict:
             index, interval, idea["option"], idea["signal"], idea["signal_time"],
             idea["entry"], idea["stop"], idea["target"], (idea.get("context") or {}).get("vix"))
 
+    def should_alert(idea: dict) -> bool:
+        """
+        Telegram alert only for the idea that is on screen right now, while the market is open.
+        Ideas found after the fact are stale, so they are saved but not sent. Old data (free Yahoo)
+        sends nothing unless TELEGRAM_ALLOW_DELAYED=1.
+        """
+        if not tg.is_configured() or not market_open:
+            return False
+        if plan["signal"] == "NONE" or plan.get("decision_time") != idea.get("decision_time"):
+            return False
+        return (not delayed) or tg.allow_delayed()
+
+    def on_new_idea(idea: dict, levels, memory) -> None:
+        tg.send_async(tg.format_idea(
+            plan if plan.get("decision_time") == idea.get("decision_time") else idea,
+            levels, memory, setup=journal.setup_line(idea.get("context") or {}),
+            index=index, interval=interval, status=plan.get("status", ""),
+            delayed_min=round(lag_min) if delayed else None))
+
+    def on_finished(info: dict) -> None:
+        tg.send_async(tg.format_result(info))
+
     try:
         journal.scan_today(analysed, index, interval, interval_min, now.date(),
-                           now.isoformat(timespec="seconds"), option_levels_for)
-        journal.update_results(analysed, index, interval_min)
+                           now.isoformat(timespec="seconds"), option_levels_for,
+                           should_alert, on_new_idea)
+        journal.update_results(analysed, index, interval_min, on_finished)
         journal_summary = journal.summary()
     except Exception as error:
         print(f"[journal] problem: {error}")
@@ -280,6 +306,76 @@ def api_snapshot():
 @app.route("/")
 def home():
     return Response(PAGE, mimetype="text/html")
+
+
+# ---------------------------------------------------------------------------
+# Telegram alerts: a background loop that watches the markets, so an idea is found (and alerted)
+# even when no browser tab is open. The alert itself is sent from inside build_payload(), which is
+# also what a browser tab calls, so a new idea is alerted ONCE, whoever finds it first.
+# ---------------------------------------------------------------------------
+ALERT_POLL_SECONDS = 30
+
+
+def _alert_markets() -> list:
+    """The (index, interval) pairs to watch, from ALERT_MARKETS (default nifty:5m,sensex:5m)."""
+    found = []
+    for part in os.environ.get("ALERT_MARKETS", "nifty:5m,sensex:5m").split(","):
+        index, _, interval = part.strip().lower().partition(":")
+        if index in ("nifty", "sensex") and interval in INTERVAL_MINUTES and (index, interval) not in found:
+            found.append((index, interval))
+    return found or [("nifty", "5m"), ("sensex", "5m")]
+
+
+def _alert_tick(source: str = None, markets: list = None) -> int:
+    """
+    One look at every watched market. Runs only on weekdays from 9:10 to 16:00 IST (the last
+    half hour after the close is for late results). Returns how many markets were checked.
+    """
+    source = source or os.environ.get("ALERT_SOURCE", "yahoo").strip().lower()
+    now = datetime.now(IST)
+    minutes = now.hour * 60 + now.minute
+    if now.weekday() >= 5 or not (9 * 60 + 10 <= minutes <= 16 * 60):
+        return 0
+    checked = 0
+    for index, interval in (markets or _alert_markets()):
+        key = (source, index, interval)
+        cached = _cache.get(key)
+        if cached and time.time() - cached[0] < CACHE_SECONDS:
+            continue                                   # a browser tab just looked at it
+        try:
+            _cache[key] = (time.time(), build_payload(source, index, interval))
+            checked += 1
+        except Exception as error:
+            print(f"[alerts] {index} {interval}: {error}")
+    return checked
+
+
+def _alert_loop() -> None:
+    while True:
+        try:
+            _alert_tick()
+        except Exception as error:
+            print(f"[alerts] problem: {error}")
+        time.sleep(ALERT_POLL_SECONDS)
+
+
+def start_alert_loop() -> threading.Thread:
+    thread = threading.Thread(target=_alert_loop, name="alert-loop", daemon=True)
+    thread.start()
+    return thread
+
+
+def _alert_banner() -> str:
+    if not tg.is_configured():
+        return ("Telegram alerts: OFF (add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to a .env file; "
+                "see .env.example)")
+    watching = ", ".join(f"{i.upper()} {t}" for i, t in _alert_markets())
+    source = os.environ.get("ALERT_SOURCE", "yahoo").strip().lower()
+    text = f"Telegram alerts: ON (watching {watching}; data: {source})"
+    if source == "yahoo" and not tg.allow_delayed():
+        text += ("\n  Note: free Yahoo data is about 15 minutes late, so NO alert is sent on old data. "
+                 "Set TELEGRAM_ALLOW_DELAYED=1 to get alerts anyway, or use Angel One.")
+    return text
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -1185,6 +1281,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--no-reload", action="store_true",
                         help="do not restart automatically when a .py file changes")
+    parser.add_argument("--no-alerts", action="store_true",
+                        help="do not run the background Telegram alert loop")
     args = parser.parse_args()
 
     url = f"http://127.0.0.1:{args.port}"
@@ -1194,6 +1292,11 @@ if __name__ == "__main__":
     if not restarted_copy:
         reload_note = "" if args.no_reload else "  Code changes reload automatically."
         print(f"Dashboard running at {url}  (press Ctrl + C to stop).{reload_note}")
+        print("Telegram alerts: switched off with --no-alerts" if args.no_alerts else _alert_banner())
         if not args.no_browser:
             threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    # Start the alert loop only in the process that really serves (not in the auto-reload watcher),
+    # so there is exactly one loop.
+    if (restarted_copy or args.no_reload) and not args.no_alerts and tg.is_configured():
+        start_alert_loop()
     app.run(host="127.0.0.1", port=args.port, debug=False, use_reloader=not args.no_reload)
