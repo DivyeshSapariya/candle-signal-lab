@@ -1,0 +1,28 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ---- Your personal data: trade history, saved candles, memory (do not publish) ----
+market_data.db
+market_data.db-journal
+trade_journal.csv
+trade_memory.csv
+trade_snapshots/
+backtest_trades.csv
+nifty_*.csv
+sensex_*.csv
+
+# ---- Broker cache and secrets (Angel One keys must never be committed) ----
+.cache/
+.env
+*.env
+
+# ---- Editor, OS and tool files ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.claude/settings.local.json

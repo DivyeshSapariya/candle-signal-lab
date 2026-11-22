@@ -1,0 +1,230 @@
+"""
+data_sources.py
+---------------
+Gets NIFTY50 / SENSEX candles from FREE sources.
+
+Source 1: "yahoo"  -> no account, no API key. Easiest. Data can be a little delayed.
+Source 2: "angel"  -> Angel One SmartAPI. Free, but needs an Angel One account.
+                      Better for live use. Set these environment variables first:
+                        ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PIN, ANGEL_TOTP_SECRET
+
+Install:
+    pip install pandas yfinance                 (for Yahoo)
+    pip install smartapi-python pyotp logzero   (only if you use Angel One)
+
+Every function returns a pandas table with columns:
+    open, high, low, close, volume     and a time index in Indian time (IST)
+"""
+
+import os
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+
+IST = ZoneInfo("Asia/Kolkata")
+
+INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15}
+
+YAHOO_SYMBOLS = {"nifty": "^NSEI", "sensex": "^BSESN"}
+
+# Angel One index tokens. If data comes back empty, check these against
+# Angel's official instrument list (OpenAPIScripMaster.json).
+ANGEL_INDEX = {"nifty": ("NSE", "99926000"), "sensex": ("BSE", "99919000")}
+ANGEL_INTERVALS = {"1m": "ONE_MINUTE", "5m": "FIVE_MINUTE", "15m": "FIFTEEN_MINUTE"}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _to_ist_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Make the time index timezone-aware in IST and name it 'datetime'."""
+    idx = pd.DatetimeIndex(df.index)
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    df = df.copy()
+    df.index = idx.tz_convert(IST)
+    df.index.name = "datetime"
+    return df
+
+
+def drop_forming_candle(df: pd.DataFrame, interval: str, now: datetime = None) -> pd.DataFrame:
+    """
+    The last candle from the API may still be running (not finished).
+    Patterns on an unfinished candle are wrong, so we remove it.
+    """
+    if df.empty:
+        return df
+    # Yahoo often sends a half-made candle with a single price (open = high = low = close).
+    # That is not a real finished candle, so remove it.
+    last = df.iloc[-1]
+    if last["open"] == last["high"] == last["low"] == last["close"]:
+        return df.iloc[:-1]
+    now = now or datetime.now(IST)
+    candle_end = df.index[-1] + timedelta(minutes=INTERVAL_MINUTES[interval])
+    if now < candle_end:
+        return df.iloc[:-1]
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Source 1: Yahoo Finance (no account needed)
+# ---------------------------------------------------------------------------
+# How much history to load by default (Yahoo limits: 1m = 7 days, 5m / 15m = 60 days)
+DEFAULT_PERIOD = {"1m": "5d", "5m": "15d", "15m": "30d"}
+
+
+def fetch_yahoo(index: str = "nifty", interval: str = "5m", period: str = None) -> pd.DataFrame:
+    import yfinance as yf
+
+    ticker = YAHOO_SYMBOLS[index]
+    df = yf.download(ticker, period=period or DEFAULT_PERIOD[interval], interval=interval,
+                     progress=False, auto_adjust=False)
+    if df is None or df.empty:
+        raise RuntimeError("Yahoo returned no data. Market may be closed or internet is down.")
+
+    # Newer yfinance versions return 2-level column names; flatten them.
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    df.columns = [str(c).lower() for c in df.columns]
+    df = df[["open", "high", "low", "close", "volume"]].dropna(subset=["open", "close"])
+    return _to_ist_index(df)
+
+
+# ---------------------------------------------------------------------------
+# Source 2: Angel One SmartAPI (free with an Angel One account)
+# ---------------------------------------------------------------------------
+_angel_client = None
+
+
+def _angel_login():
+    global _angel_client
+    if _angel_client is not None:
+        return _angel_client
+
+    from SmartApi import SmartConnect
+    import pyotp
+
+    missing = [k for k in ("ANGEL_API_KEY", "ANGEL_CLIENT_ID", "ANGEL_PIN", "ANGEL_TOTP_SECRET")
+               if not os.environ.get(k)]
+    if missing:
+        raise RuntimeError(f"Set these environment variables first: {', '.join(missing)}")
+
+    client = SmartConnect(api_key=os.environ["ANGEL_API_KEY"])
+    otp = pyotp.TOTP(os.environ["ANGEL_TOTP_SECRET"]).now()
+    session = client.generateSession(os.environ["ANGEL_CLIENT_ID"],
+                                     os.environ["ANGEL_PIN"], otp)
+    if not session or not session.get("status"):
+        raise RuntimeError(f"Angel One login failed: {session}")
+    _angel_client = client
+    return client
+
+
+def fetch_angel(index: str = "nifty", interval: str = "5m", days: int = None) -> pd.DataFrame:
+    client = _angel_login()
+    days = days or {"1m": 5, "5m": 15, "15m": 30}[interval]
+    exchange, token = ANGEL_INDEX[index]
+    now = datetime.now(IST)
+    params = {
+        "exchange": exchange,
+        "symboltoken": token,
+        "interval": ANGEL_INTERVALS[interval],
+        "fromdate": (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M"),
+        "todate": now.strftime("%Y-%m-%d %H:%M"),
+    }
+    res = client.getCandleData(params)
+    rows = (res or {}).get("data")
+    if not rows:
+        raise RuntimeError(f"Angel One returned no candles: {res}")
+
+    df = pd.DataFrame(rows, columns=["datetime", "open", "high", "low", "close", "volume"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.set_index("datetime")
+    return _to_ist_index(df)
+
+
+# ---------------------------------------------------------------------------
+# Angel One: real option price (LTP) for one strike
+# ---------------------------------------------------------------------------
+SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+OPTION_SEGMENT = {"nifty": ("NFO", "NIFTY"), "sensex": ("BFO", "SENSEX")}
+_scrip_master = {"date": None, "rows": None}
+
+
+def _load_scrip_master():
+    """Angel One's list of all instruments. Downloaded once a day and saved in .cache/"""
+    import json
+    import urllib.request
+
+    today = datetime.now(IST).strftime("%Y%m%d")
+    if _scrip_master["date"] == today and _scrip_master["rows"]:
+        return _scrip_master["rows"]
+
+    os.makedirs(".cache", exist_ok=True)
+    path = os.path.join(".cache", f"scrip_master_{today}.json")
+    if not os.path.exists(path):
+        urllib.request.urlretrieve(SCRIP_MASTER_URL, path)
+    with open(path, "r", encoding="utf-8") as f:
+        rows = json.load(f)
+    _scrip_master.update(date=today, rows=rows)
+    return rows
+
+
+def fetch_angel_option(index: str, strike: int, side: str) -> dict:
+    """
+    Finds the nearest-expiry option contract and returns its live price.
+    Returns: {"ltp": float, "symbol": str, "expiry": date}
+    """
+    client = _angel_login()
+    segment, name = OPTION_SEGMENT[index]
+    now = datetime.now(IST)
+
+    best = None
+    for row in _load_scrip_master():
+        if (row.get("name") != name or row.get("exch_seg") != segment
+                or row.get("instrumenttype") != "OPTIDX"
+                or not str(row.get("symbol", "")).endswith(side)):
+            continue
+        try:
+            if abs(float(row["strike"]) / 100.0 - strike) > 0.01:
+                continue
+            expiry = datetime.strptime(row["expiry"], "%d%b%Y").date()
+        except (KeyError, ValueError):
+            continue
+        # skip contracts that have already expired (expiry day after 3:30 pm counts as expired)
+        if expiry < now.date() or (expiry == now.date() and now.hour * 60 + now.minute >= 15 * 60 + 30):
+            continue
+        if best is None or expiry < best[0]:
+            best = (expiry, row)
+
+    if best is None:
+        raise RuntimeError(f"No {name} {strike} {side} contract found in Angel One list.")
+
+    expiry, row = best
+    res = client.ltpData(segment, row["symbol"], row["token"])
+    ltp = (res or {}).get("data", {}).get("ltp")
+    if not ltp:
+        raise RuntimeError(f"Angel One returned no option price: {res}")
+    return {"ltp": float(ltp), "symbol": row["symbol"], "expiry": expiry}
+
+
+# ---------------------------------------------------------------------------
+# One function to use everywhere
+# ---------------------------------------------------------------------------
+def get_candles(source: str = "yahoo", index: str = "nifty", interval: str = "5m",
+                include_forming: bool = False) -> pd.DataFrame:
+    """Returns only FINISHED candles (set include_forming=True to also get the running one)."""
+    if interval not in INTERVAL_MINUTES:
+        raise ValueError(f"interval must be one of {list(INTERVAL_MINUTES)}")
+    if index not in YAHOO_SYMBOLS:
+        raise ValueError("index must be 'nifty' or 'sensex'")
+
+    if source == "yahoo":
+        df = fetch_yahoo(index, interval)
+    elif source == "angel":
+        df = fetch_angel(index, interval)
+    else:
+        raise ValueError("source must be 'yahoo' or 'angel'")
+
+    return df if include_forming else drop_forming_candle(df, interval)
