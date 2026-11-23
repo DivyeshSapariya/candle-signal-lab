@@ -180,7 +180,7 @@ How to read them:
 ### When an alert is sent
 
 - Only for the idea that is on the screen **right now**, while the market is open. An idea found after the fact (it appeared while nobody was looking) is saved in the history but not sent, because it would be stale.
-- **Free Yahoo data is about 15 minutes late**, so by default NO alert is sent on old data: the entry moment has usually passed. To get alerts anyway, set `TELEGRAM_ALLOW_DELAYED=1`. Or use Angel One for live data.
+- **Free Yahoo data is always about 15 minutes late.** Alerts are sent anyway, and each one starts with a `DELAYED DATA: about N min old` line, because the entry moment may already have passed. To send nothing on old data, set `TELEGRAM_ALLOW_DELAYED=0`. Or use Angel One for live data.
 - **Each alert is sent exactly once**, also after a restart or an auto-reload (the journal remembers it in its `alerts` column). The result message is only sent for ideas that were alerted.
 - **A browser tab is not needed.** While `python dashboard.py` runs (keep the terminal open), a background loop checks NIFTY and SENSEX (5 minute candles) every 30 seconds on weekdays from 9:10 to 16:00 IST. Use `--no-alerts` to turn the loop off.
 - If Telegram is down or the token is wrong, a short note is printed in the terminal. The dashboard keeps working.
@@ -198,7 +198,7 @@ How to read them:
    TELEGRAM_CHAT_ID=-1001234567890
    ```
 
-   For free Yahoo data, also remove the `#` from the line `TELEGRAM_ALLOW_DELAYED=1`. Put real values only in `.env`, never in `.env.example`.
+   Put real values only in `.env`, never in `.env.example`.
 6. **Test it.** Run `python telegram_notify.py --check` (it checks the token and shows the bot's name; the token itself is never shown), then `python telegram_notify.py --test` (it sends a test message to the chat).
 7. **Start the dashboard** with `python dashboard.py`. The first lines say `Telegram alerts: ON` (or `OFF` and what is missing).
 
@@ -210,7 +210,7 @@ Put them in `.env` or set them in the terminal (a value set in the terminal wins
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Required. From @BotFather. Anyone who has it can send messages as your bot. |
 | `TELEGRAM_CHAT_ID` | Required. The group or chat that receives the messages. |
-| `TELEGRAM_ALLOW_DELAYED` | `1` = also send alerts when the data is old. The message then starts with a `DELAYED DATA` line. Default: off. |
+| `TELEGRAM_ALLOW_DELAYED` | Alerts are also sent when the data is old (free Yahoo always is); the message then starts with a `DELAYED DATA` line. Set it to `0` to send nothing on old data. Default: alerts are sent. |
 | `ALERT_MARKETS` | The markets the loop watches. Default `nifty:5m,sensex:5m`. |
 | `ALERT_SOURCE` | `yahoo` (default) or `angel`. |
 
@@ -447,7 +447,7 @@ The Angel One code is written but not tested on a live account yet.
 | VIX filter skipped | India VIX could not be downloaded. The rest still works. |
 | Option price says ESTIMATE with Angel One | Live option price could not be fetched. Read the `[option price] ...` message in the terminal. |
 | Angel One login failed | Check the 4 environment variables in the same terminal and the TOTP secret. |
-| No Telegram alert arrives | Check that the first lines of `python dashboard.py` say `Telegram alerts: ON`. With free Yahoo data set `TELEGRAM_ALLOW_DELAYED=1` (old data sends nothing by default). Alerts are only for the idea on screen right now, while the market is open. Run `python telegram_notify.py --check` and `--test` (section 3c). |
+| No Telegram alert arrives | Check that the first lines of `python dashboard.py` say `Telegram alerts: ON`. Make sure `TELEGRAM_ALLOW_DELAYED=0` is not set in `.env` (that blocks alerts on old data, which free Yahoo always is). Alerts are only for the idea on screen right now, while the market is open. Run `python telegram_notify.py --check` and `--test` (section 3c). |
 | `--find-chat` shows no chat | Add the bot to the group, send `/start@yourbotname` there, then run it again. |
 | Telegram says "chat not found" | The chat id is wrong, or the bot is not in the group. Run `--find-chat` again. |
 

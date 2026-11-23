@@ -20,8 +20,9 @@ Setup (once)
 Settings (environment variables or the .env file)
   TELEGRAM_BOT_TOKEN       required. Keep it secret. Anyone with it can send messages as your bot.
   TELEGRAM_CHAT_ID         required. Where the messages go.
-  TELEGRAM_ALLOW_DELAYED   1 = also alert when the data is old (free Yahoo data is about 15 minutes
-                           late). The message then says so. Default: no alert on old data.
+  TELEGRAM_ALLOW_DELAYED   Alerts are also sent when the data is old (free Yahoo data is always about
+                           15 minutes late); the message then starts with a DELAYED DATA line.
+                           Set it to 0 to send nothing on old data. Default: alerts are sent.
   ALERT_MARKETS            markets the dashboard watches for alerts. Default nifty:5m,sensex:5m
   ALERT_SOURCE             yahoo (default) or angel
 
@@ -85,7 +86,12 @@ def is_configured() -> bool:
 
 
 def allow_delayed() -> bool:
-    return _setting("TELEGRAM_ALLOW_DELAYED").lower() in ("1", "true", "yes", "on")
+    """
+    Alerts on old data are ON by default: free Yahoo data is always about 15 minutes late, so
+    blocking old data would block every alert. Such a message starts with a DELAYED DATA line.
+    Set TELEGRAM_ALLOW_DELAYED=0 to send nothing on old data.
+    """
+    return _setting("TELEGRAM_ALLOW_DELAYED").lower() not in ("0", "false", "no", "off")
 
 
 def _api_base() -> str:
@@ -298,7 +304,7 @@ def _cli_check() -> int:
     token, chat = _setting("TELEGRAM_BOT_TOKEN"), _setting("TELEGRAM_CHAT_ID")
     print(f"TELEGRAM_BOT_TOKEN : {'set (' + str(len(token)) + ' characters, hidden)' if token else 'NOT set'}")
     print(f"TELEGRAM_CHAT_ID   : {chat or 'NOT set'}")
-    print(f"Alerts on old data : {'yes (TELEGRAM_ALLOW_DELAYED)' if allow_delayed() else 'no (default)'}")
+    print(f"Alerts on old data : {'yes (default, marked DELAYED DATA)' if allow_delayed() else 'no (TELEGRAM_ALLOW_DELAYED=0)'}")
     print(f"Markets watched    : {_setting('ALERT_MARKETS') or 'nifty:5m,sensex:5m (default)'}")
     print(f"Data source        : {_setting('ALERT_SOURCE') or 'yahoo (default)'}")
     if not token:
