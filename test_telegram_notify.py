@@ -252,6 +252,27 @@ def test_journal_flow():
     print("ok  journal: one alert per new idea, none after a restart, one result alert, stale ideas quiet")
 
 
+def test_alerts_on_old_data_by_default():
+    """Free Yahoo data is always late, so blocking old data would block every alert."""
+    import dashboard
+    os.environ.pop("TELEGRAM_ALLOW_DELAYED", None)
+    assert tg.allow_delayed(), "alerts on old data must be ON when nothing is set"
+    for value in ("1", "true", "yes", "on", ""):
+        os.environ["TELEGRAM_ALLOW_DELAYED"] = value
+        assert tg.allow_delayed(), f"TELEGRAM_ALLOW_DELAYED={value!r} must keep alerts on"
+    for value in ("0", "false", "No", "OFF"):
+        os.environ["TELEGRAM_ALLOW_DELAYED"] = value
+        assert not tg.allow_delayed(), f"TELEGRAM_ALLOW_DELAYED={value!r} must switch alerts on old data off"
+    # what the startup message tells you
+    os.environ.update(TELEGRAM_BOT_TOKEN=TOKEN, TELEGRAM_CHAT_ID=CHAT, ALERT_SOURCE="yahoo")
+    os.environ.pop("TELEGRAM_ALLOW_DELAYED", None)
+    assert "DELAYED DATA" in dashboard._alert_banner() and "NO alert" not in dashboard._alert_banner()
+    os.environ["TELEGRAM_ALLOW_DELAYED"] = "0"
+    assert "NO alert will be sent" in dashboard._alert_banner()
+    os.environ.pop("TELEGRAM_ALLOW_DELAYED", None)
+    print("ok  old data: alerts are sent by default (marked DELAYED DATA); TELEGRAM_ALLOW_DELAYED=0 turns them off")
+
+
 def main():
     saved = dict(os.environ)
     fake = FakeTelegram()
@@ -259,6 +280,7 @@ def main():
         test_env_file()
         test_messages()
         test_sending(fake)
+        test_alerts_on_old_data_by_default()
         test_journal_flow()
     finally:
         fake.stop()

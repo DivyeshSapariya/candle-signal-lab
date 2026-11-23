@@ -165,8 +165,9 @@ def build_payload(source: str, index: str, interval: str) -> dict:
     def should_alert(idea: dict) -> bool:
         """
         Telegram alert only for the idea that is on screen right now, while the market is open.
-        Ideas found after the fact are stale, so they are saved but not sent. Old data (free Yahoo)
-        sends nothing unless TELEGRAM_ALLOW_DELAYED=1.
+        Ideas found after the fact are stale, so they are saved but not sent. Old data (free Yahoo
+        is always about 15 minutes late) still sends the alert, marked DELAYED DATA, unless
+        TELEGRAM_ALLOW_DELAYED=0.
         """
         if not tg.is_configured() or not market_open:
             return False
@@ -372,9 +373,12 @@ def _alert_banner() -> str:
     watching = ", ".join(f"{i.upper()} {t}" for i, t in _alert_markets())
     source = os.environ.get("ALERT_SOURCE", "yahoo").strip().lower()
     text = f"Telegram alerts: ON (watching {watching}; data: {source})"
-    if source == "yahoo" and not tg.allow_delayed():
-        text += ("\n  Note: free Yahoo data is about 15 minutes late, so NO alert is sent on old data. "
-                 "Set TELEGRAM_ALLOW_DELAYED=1 to get alerts anyway, or use Angel One.")
+    if source == "yahoo" and tg.allow_delayed():
+        text += ("\n  Note: free Yahoo data is about 15 minutes late, so each alert says DELAYED DATA. "
+                 "Use Angel One for live data, or set TELEGRAM_ALLOW_DELAYED=0 to skip alerts on old data.")
+    elif source == "yahoo":
+        text += ("\n  Note: free Yahoo data is about 15 minutes late and TELEGRAM_ALLOW_DELAYED=0, "
+                 "so NO alert will be sent. Remove that setting to get alerts.")
     return text
 
 
