@@ -202,41 +202,55 @@ def add_vix(f: pd.DataFrame, vix_daily) -> pd.DataFrame:
     return f
 
 
-def add_vwap_volume_gap(f: pd.DataFrame) -> pd.DataFrame:
+def add_vwap_volume_gap(f: pd.DataFrame, fut: pd.DataFrame = None) -> pd.DataFrame:
     """
     vwap       : today's volume-weighted average price up to and including each candle.
-                 Yahoo gives NO volume for the indexes, so then every candle weighs the same
-                 (a plain average of today's prices, "vwap_proxy" = True).
-    vol_ratio  : candle volume / average of the last 20 candles (NaN when there is no volume).
+                 The weight is the volume of the index FUTURE (fut) when it is given, because the
+                 index itself has no volume. For a day without any volume every candle weighs the
+                 same (a plain average of the day's prices) and vwap_proxy is True for that day.
+    vol_ratio  : future volume of the candle / average of the last 20 candles (NaN without volume).
     gap_pct    : today's opening price vs yesterday's close, in %. Known from the first candle.
     Only past and current candles are used, so there is no look-ahead.
     """
     f = f.copy()
     day = pd.Series(f.index.normalize(), index=f.index)
     typical = (f["high"] + f["low"] + f["close"]) / 3
+
     vol = f["volume"].fillna(0).astype(float)
-    has_volume = bool(vol.sum() > 0)
-    weight = vol if has_volume else pd.Series(1.0, index=f.index)
+    if fut is not None and len(fut):
+        fv = fut["volume"].astype(float)
+        fv = fv[~fv.index.duplicated(keep="last")]
+        vol = fv.reindex(f.index).fillna(0.0)
+    day_volume = vol.groupby(day).transform("sum")
+    has_volume = day_volume > 0                               # per day: is there real volume?
+    weight = vol.where(has_volume, 1.0)
     num = (typical * weight).groupby(day).cumsum()
-    den = weight.groupby(day).cumsum().replace(0, np.nan)
+    den = weight.groupby(day).cumsum()
     f["vwap"] = num / den
-    f["vwap_proxy"] = not has_volume
-    f["vol_ratio"] = (vol / vol.shift(1).rolling(VOLUME_AVG_CANDLES).mean().replace(0, np.nan)
-                      if has_volume else np.nan)
+    f["vwap_proxy"] = ~has_volume
+
+    known = vol.where(vol > 0)                                # missing / zero volume is "unknown"
+    avg = known.shift(1).rolling(VOLUME_AVG_CANDLES, min_periods=VOLUME_AVG_CANDLES // 2).mean()
+    f["vol_ratio"] = known / avg.replace(0, np.nan)
+
     day_open = f["open"].groupby(day).transform("first")
     f["gap_pct"] = (day_open - f["pdc"]) / f["pdc"] * 100
     return f
 
 
-def compute_features(df: pd.DataFrame, index: str, interval_min: int, vix_daily=None) -> pd.DataFrame:
-    """Everything the engine needs for every candle. Input: finished candles only."""
+def compute_features(df: pd.DataFrame, index: str, interval_min: int, vix_daily=None,
+                     fut: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Everything the engine needs for every candle. Input: finished candles only.
+    fut = candles of the index future (same candle size) used only for its volume.
+    """
     f = add_patterns(df)
     f = add_indicators(f)
     f = add_adx(f)
     f["htf15"] = higher_timeframe_trend(df, 15, interval_min)
     f["htf60"] = higher_timeframe_trend(df, 60, interval_min)
     f = add_levels(f)
-    f = add_vwap_volume_gap(f)
+    f = add_vwap_volume_gap(f, fut)
     f = add_vix(f, vix_daily)
 
     f["day"] = f.index.date

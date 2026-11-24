@@ -17,6 +17,7 @@ Every function returns a pandas table with columns:
 """
 
 import os
+import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -126,41 +127,61 @@ def _angel_login():
     return client
 
 
-ANGEL_CALL_GAP_SECONDS = 2.0        # Angel One refuses candle requests that come too fast
-ANGEL_RETRY_WAITS = (5, 10, 20, 40)   # seconds to wait before each retry after "exceeding access rate"
+ANGEL_CALL_GAP_SECONDS = 2.0        # Angel One refuses requests that come too fast
+ANGEL_RETRY_WAITS = (3, 6, 12)      # seconds to wait before each retry after "exceeding access rate"
 _angel_last_call = [0.0]
+_angel_lock = threading.RLock()     # the dashboard serves several requests at once; Angel One must see ONE at a time
+
+
+def angel_too_fast(res=None, error=None) -> bool:
+    """True when Angel One answered 'too many requests' / 'exceeding access rate'."""
+    if error is not None:
+        return "access rate" in str(error).lower() or "too many requests" in str(error).lower()
+    return (isinstance(res, dict) and not res.get("status")
+            and ("too many requests" in str(res.get("message", "")).lower()
+                 or res.get("errorcode") == "AB1021"))
+
+
+def _angel_request(call):
+    """
+    Run ONE Angel One request (candles, price, ...) one at a time, with a pause after the previous
+    one, and a few retries when Angel One says 'too fast'. All Angel One calls should go through here.
+    """
+    import time
+
+    with _angel_lock:
+        for attempt in range(len(ANGEL_RETRY_WAITS) + 1):
+            wait = ANGEL_CALL_GAP_SECONDS - (time.time() - _angel_last_call[0])
+            if wait > 0:
+                time.sleep(wait)
+            _angel_last_call[0] = time.time()
+            try:
+                res = call()
+                if not angel_too_fast(res=res):
+                    return res
+                error = RuntimeError(str(res))
+            except Exception as raised:
+                error = raised
+                if not angel_too_fast(error=raised):
+                    raise
+            if attempt == len(ANGEL_RETRY_WAITS):
+                raise error
+            time.sleep(ANGEL_RETRY_WAITS[attempt])
 
 
 def _angel_get_candles(client, params: dict):
-    """getCandleData with a pause between calls and a few retries when Angel One says 'too fast'."""
-    import time
-
-    for attempt in range(len(ANGEL_RETRY_WAITS) + 1):
-        wait = ANGEL_CALL_GAP_SECONDS - (time.time() - _angel_last_call[0])
-        if wait > 0:
-            time.sleep(wait)
-        _angel_last_call[0] = time.time()
-        try:
-            res = client.getCandleData(params)
-            too_fast = (isinstance(res, dict) and not res.get("status")
-                        and ("too many requests" in str(res.get("message", "")).lower()
-                             or res.get("errorcode") == "AB1021"))
-            if not too_fast:
-                return res
-            error = RuntimeError(str(res))
-        except Exception as raised:
-            error = raised
-            too_fast = "access rate" in str(raised).lower()
-        if not too_fast or attempt == len(ANGEL_RETRY_WAITS):
-            raise error
-        time.sleep(ANGEL_RETRY_WAITS[attempt])
+    """getCandleData through the one-at-a-time, retrying request wrapper."""
+    return _angel_request(lambda: client.getCandleData(params))
 
 
 def fetch_angel_range(index: str, interval: str, start: datetime, end: datetime,
-                      allow_empty: bool = False) -> pd.DataFrame:
-    """Candles between two times (IST). Angel One limits how long one request may be (see candle_store)."""
+                      allow_empty: bool = False, instrument: tuple = None) -> pd.DataFrame:
+    """
+    Candles between two times (IST). Angel One limits how long one request may be (see candle_store).
+    instrument = (exchange, token) to fetch something other than the index, such as a future.
+    """
     client = _angel_login()
-    exchange, token = ANGEL_INDEX[index]
+    exchange, token = instrument or ANGEL_INDEX[index]
     params = {
         "exchange": exchange,
         "symboltoken": token,
@@ -215,6 +236,32 @@ def _load_scrip_master():
     return rows
 
 
+def angel_futures(index: str, now: datetime = None) -> list:
+    """Futures contracts of the index that have not expired yet, nearest first."""
+    segment, name = OPTION_SEGMENT[index]
+    now = now or datetime.now(IST)
+    out = []
+    for row in _load_scrip_master():
+        if (row.get("name") != name or row.get("exch_seg") != segment
+                or row.get("instrumenttype") != "FUTIDX"):
+            continue
+        try:
+            expiry = datetime.strptime(row["expiry"], "%d%b%Y").date()
+        except (KeyError, ValueError):
+            continue
+        if expiry < now.date() or (expiry == now.date() and now.hour * 60 + now.minute >= 15 * 60 + 30):
+            continue
+        out.append({"expiry": expiry, "symbol": row["symbol"], "token": row["token"], "exchange": segment})
+    return sorted(out, key=lambda c: c["expiry"])
+
+
+def fetch_angel_future(index: str, interval: str, start: datetime, end: datetime,
+                       contract: dict, allow_empty: bool = False) -> pd.DataFrame:
+    """Candles (with real volume) of one futures contract."""
+    return fetch_angel_range(index, interval, start, end, allow_empty,
+                             instrument=(contract["exchange"], contract["token"]))
+
+
 def fetch_angel_option(index: str, strike: int, side: str) -> dict:
     """
     Finds the nearest-expiry option contract and returns its live price.
@@ -246,7 +293,7 @@ def fetch_angel_option(index: str, strike: int, side: str) -> dict:
         raise RuntimeError(f"No {name} {strike} {side} contract found in Angel One list.")
 
     expiry, row = best
-    res = client.ltpData(segment, row["symbol"], row["token"])
+    res = _angel_request(lambda: client.ltpData(segment, row["symbol"], row["token"]))
     ltp = (res or {}).get("data", {}).get("ltp")
     if not ltp:
         raise RuntimeError(f"Angel One returned no option price: {res}")

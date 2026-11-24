@@ -22,6 +22,10 @@ Use stored history in your own code:
 Note: 1-minute candles only reach back 7 days on Yahoo, so run this at least once a week
 (daily is better) or you will lose minutes that cannot be downloaded later.
 
+Futures volume (real volume for VWAP; the index itself has none):
+    python candle_store.py backfill-futures                    # saved as NIFTY_FUT / SENSEX_FUT
+Expired contracts cannot be downloaded, so run this at least once a month (before the expiry).
+
 Longer history from Angel One (needs the ANGEL_* values in .env, read-only, no orders):
     python candle_store.py backfill --days 365                 # NIFTY + SENSEX, 5m and 15m
     python candle_store.py backfill --days 365 --index nifty --interval 5m
@@ -118,7 +122,7 @@ def collect_one(con, index: str, interval: str) -> str:
 
 
 def backfill_one(con, index: str, interval: str, days: int, fetch=None, pause=None,
-                 now: datetime = None, log=print) -> str:
+                 now: datetime = None, log=print, oldest: datetime = None) -> str:
     """
     Download the last `days` days from Angel One, newest piece first, saving each piece at once.
     Stops early after a few empty pieces in a row (no older data exists). Safe to run again.
@@ -126,7 +130,7 @@ def backfill_one(con, index: str, interval: str, days: int, fetch=None, pause=No
     fetch = fetch or fetch_angel_range
     now = now or datetime.now(IST)
     step = timedelta(days=ANGEL_CHUNK_DAYS[interval])
-    oldest = now - timedelta(days=days)
+    oldest = oldest or now - timedelta(days=days)
     before = con.execute("SELECT COUNT(*) FROM candles WHERE idx=? AND interval=?", (index, interval)).fetchone()[0]
 
     end, pieces, empty_run, fetched, note = now, 0, 0, 0, "ok"
@@ -158,6 +162,42 @@ def backfill_one(con, index: str, interval: str, days: int, fetch=None, pause=No
                  oldest.isoformat(timespec="seconds"), now.isoformat(timespec="seconds"), f"backfill {note}"[:300]))
     con.commit()
     return f"{pieces} requests, fetched {fetched}, new {after - before}, total {after} ({note})"
+
+
+def backfill_futures(con, index: str, interval: str, days: int = 120, contracts=None, now: datetime = None,
+                     log=print, fetch=None) -> str:
+    """
+    Save the index FUTURES candles (real volume) under the name "<index>_fut".
+    Each contract is saved only for the time it was the nearest one (the busy one): from the day
+    after the previous monthly expiry until its own expiry. Old, expired contracts cannot be
+    downloaded any more, so volume history starts from the oldest contract that is still listed.
+    """
+    from data_sources import angel_futures, fetch_angel_future
+    from option_pricer import previous_monthly_expiry
+
+    now = now or datetime.now(IST)
+    # judged from 9:00 am of today, so a contract that expires TODAY is still saved after the close
+    contracts = contracts if contracts is not None else angel_futures(
+        index, now.replace(hour=9, minute=0, second=0, microsecond=0))
+    key = f"{index}_fut"
+    notes = []
+    for c in contracts[:2]:                                    # the nearest two are enough for the days we keep
+        busy_from = datetime.combine(previous_monthly_expiry(index, c["expiry"]) + timedelta(days=1),
+                                     datetime.min.time(), IST)
+        busy_to = min(now, datetime.combine(c["expiry"], datetime.max.time().replace(microsecond=0), IST))
+        start = max(busy_from, now - timedelta(days=days))
+        if start >= busy_to:
+            continue
+        contract_fetch = fetch or (lambda k, i, s, e, allow_empty=False, c=c: fetch_angel_future(
+            index, i, s, e, c, allow_empty))
+        notes.append(f"{c['symbol']}: " + backfill_one(con, key, interval, days, fetch=contract_fetch, now=busy_to,
+                                                         log=log, oldest=start))
+    return "; ".join(notes) or "no contract was the nearest one in this period"
+
+
+def load_futures(index: str, interval: str, path: str = DB_FILE) -> pd.DataFrame:
+    """Saved futures candles (same format as load_candles). Empty table when none are saved."""
+    return load_candles(f"{index}_fut", interval, path)
 
 
 def collect_vix(con) -> str:
@@ -222,7 +262,7 @@ def status(con) -> None:
 
 def main():
     p = argparse.ArgumentParser(description="Collect candles into a local SQLite database.")
-    p.add_argument("action", choices=["collect", "backfill", "status", "export"])
+    p.add_argument("action", choices=["collect", "backfill", "backfill-futures", "status", "export"])
     p.add_argument("--days", type=int, default=365, help="backfill: how many days back (default 365)")
     p.add_argument("--index", choices=list(INDEXES), help="only this index (default: both)")
     p.add_argument("--interval", choices=list(INTERVAL_MINUTES), help="only this candle size (default: all)")
@@ -240,6 +280,15 @@ def main():
         df = load_candles(args.index, args.interval, args.db)
         df.to_csv(args.out)
         print(f"Wrote {len(df)} candles to {args.out}")
+    elif args.action == "backfill-futures":
+        import telegram_notify
+        telegram_notify.load_env_file()
+        for idx in ([args.index] if args.index else INDEXES):
+            for interval in ([args.interval] if args.interval else BACKFILL_INTERVALS):
+                print(f"{idx.upper()} futures {interval}: downloading from Angel One...")
+                print(f"  -> {backfill_futures(con, idx, interval, args.days if args.days != 365 else 120)}")
+        print()
+        status(con)
     elif args.action == "backfill":
         import telegram_notify
         telegram_notify.load_env_file()          # reads the ANGEL_* values from the private .env

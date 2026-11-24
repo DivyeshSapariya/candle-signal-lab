@@ -30,7 +30,8 @@ import candle_journal as journal
 import candle_memory
 import telegram_notify as tg
 from candle_patterns import PATTERN_INFO
-from data_sources import IST, INTERVAL_MINUTES, drop_forming_candle, fetch_angel_option, get_candles
+from data_sources import (IST, INTERVAL_MINUTES, angel_futures, angel_too_fast, drop_forming_candle, fetch_angel_future,
+                          fetch_angel_option, get_candles)
 from option_pricer import build_option_levels, get_vix_daily
 from candle_analysis import live_analysis, rejected_setups
 from candle_signals import compute_features
@@ -52,6 +53,7 @@ def default_source() -> str:
     return "angel" if all(os.environ.get(k) for k in ANGEL_KEYS) else "yahoo"
 
 
+STALE_SECONDS = 300                       # if the data source fails, show the last good data for up to 5 minutes
 CACHE_SECONDS = 10                        # do not call the data source more than every 10s
 _cache = {}
 SERVER_TOKEN = str(time.time())           # new value every time the server restarts (page auto-refresh)
@@ -65,6 +67,31 @@ def chart_time(ts) -> int:
     return int(ts.timestamp()) + IST_OFFSET_SECONDS
 
 
+_future_cache = {}
+FUTURE_CACHE_SECONDS = 60
+FUTURE_DAYS = 6               # enough candles for the 20-candle volume average
+
+
+def _live_futures(index: str, interval: str):
+    """
+    Recent candles of the nearest index future (real volume), only with Angel One. Cached for a
+    minute. Returns None when it cannot be fetched: the VWAP then falls back to the day's average price.
+    """
+    key = (index, interval)
+    cached = _future_cache.get(key)
+    if cached and time.time() - cached[0] < FUTURE_CACHE_SECONDS:
+        return cached[1]
+    try:
+        contract = angel_futures(index)[0]
+        now = datetime.now(IST)
+        df = fetch_angel_future(index, interval, now - timedelta(days=FUTURE_DAYS), now, contract)
+    except Exception as error:
+        print(f"[futures] volume not available: {error}")
+        df = None
+    _future_cache[key] = (time.time(), df)
+    return df
+
+
 def build_payload(source: str, index: str, interval: str) -> dict:
     full = get_candles(source, index, interval, include_forming=True)
     finished = drop_forming_candle(full, interval)
@@ -72,7 +99,8 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         raise RuntimeError("Not enough finished candles yet. Try again in a few minutes.")
 
     interval_min = INTERVAL_MINUTES[interval]
-    analysed = compute_features(finished, index, interval_min, get_vix_daily())
+    fut = _live_futures(index, interval) if source == "angel" else None
+    analysed = compute_features(finished, index, interval_min, get_vix_daily(), fut)
     pattern_cols = list(PATTERN_INFO.keys())
 
     # --- candles for the chart (includes the running candle) ---
@@ -240,6 +268,28 @@ def build_payload(source: str, index: str, interval: str) -> dict:
     }
 
 
+_build_locks = {}
+_build_locks_guard = threading.Lock()
+
+
+def _fresh_payload(source: str, index: str, interval: str) -> dict:
+    """
+    The data for one market. Only ONE build per market runs at a time: requests that arrive while it
+    is running wait for it and then use its result, so several tabs or the alert loop never repeat
+    the same data-source calls (Angel One refuses too many requests).
+    """
+    key = (source, index, interval)
+    with _build_locks_guard:
+        lock = _build_locks.setdefault(key, threading.Lock())
+    with lock:
+        cached = _cache.get(key)
+        if cached and time.time() - cached[0] < CACHE_SECONDS:
+            return cached[1]
+        payload = build_payload(source, index, interval)
+        _cache[key] = (time.time(), payload)
+        return payload
+
+
 @app.route("/api/data")
 def api_data():
     source = request.args.get("source", default_source())
@@ -256,11 +306,17 @@ def api_data():
         return jsonify(cached[1])
 
     try:
-        payload = build_payload(source, index, interval)
+        payload = _fresh_payload(source, index, interval)
     except Exception as error:
+        busy = angel_too_fast(error=error)
+        if cached and time.time() - cached[0] < STALE_SECONDS:
+            # keep showing the last good numbers instead of an error box; the next refresh tries again
+            return jsonify({**cached[1], "stale": True})
+        if busy:
+            return jsonify({"error": "Angel One is busy (too many requests). "
+                                     "Waiting a few seconds and trying again automatically."}), 502
         return jsonify({"error": str(error)}), 502
 
-    _cache[key] = (time.time(), payload)
     return jsonify(payload)
 
 
@@ -360,7 +416,7 @@ def _alert_tick(source: str = None, markets: list = None) -> int:
         if cached and time.time() - cached[0] < CACHE_SECONDS:
             continue                                   # a browser tab just looked at it
         try:
-            _cache[key] = (time.time(), build_payload(source, index, interval))
+            _fresh_payload(source, index, interval)
             checked += 1
         except Exception as error:
             print(f"[alerts] {index} {interval}: {error}")

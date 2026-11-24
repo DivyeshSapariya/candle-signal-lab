@@ -69,11 +69,15 @@ def breakdown(trades: list, key):
 
 def report(index: str, interval: str, db: str):
     df = candle_store.load_candles(index, interval, db)
+    fut = candle_store.load_futures(index, interval, db)
     if df is None or len(df) < 100:
         print(f"\n{index.upper()} {interval}: not enough saved candles (run: python candle_store.py collect)")
         return
     interval_min = INTERVAL_MINUTES[interval]
-    f = compute_features(df, index, interval_min, candle_store.load_vix(db))
+    f = compute_features(df, index, interval_min, candle_store.load_vix(db), fut if len(fut) else None)
+    real = int((~f["vwap_proxy"]).sum())
+    print(f"Futures volume covers {real} of {len(f)} candles"
+          f"{'' if real else ' (none saved yet: run python candle_store.py backfill-futures)'}")
     days = len(pd.unique(f["day"]))
     print(f"\n{'=' * 78}\n{index.upper()} {interval}: {len(f)} candles, {days} trading days\n{'=' * 78}")
 
@@ -111,12 +115,12 @@ def report(index: str, interval: str, db: str):
     print("  ", one_line("Default rules", stats(t01, REWARD_TO_RISK, COST_R)))
     for name in ("volume", "gap"):
         if name == "volume" and not f["vol_ratio"].notna().any():
-            print(f"   {FILTER_LABELS[name][:44]:<44} not available: Yahoo gives no index volume")
+            print(f"   {FILTER_LABELS[name][:44]:<44} not available: no futures volume saved")
             continue
         trades = run_backtest(f, index, interval_min, {name: True}, REWARD_TO_RISK, COST_R)
         print("  ", one_line(f"+ {FILTER_LABELS[name]}"[:44], stats(trades, REWARD_TO_RISK, COST_R)))
-    if f["vwap_proxy"].iloc[0]:
-        print("   (VWAP here is the plain average price of the day, because there is no volume.)")
+    if f["vwap_proxy"].any():
+        print("   (On days without futures volume, VWAP is the plain average price of the day.)")
 
     print(f"\n4) BREAKDOWN (groups of {MIN_GROUP}+ trades only; for ideas, not proof)")
     for title, key in (

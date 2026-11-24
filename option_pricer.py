@@ -99,6 +99,17 @@ def is_expiry_day(index: str, d: date) -> bool:
     return _previous_trading_day(candidate) == d
 
 
+def previous_monthly_expiry(index: str, expiry: date) -> date:
+    """
+    The monthly futures expiry before `expiry`: the last expiry-weekday of the previous month
+    (NIFTY Tuesday, SENSEX Thursday), moved back past weekends and holidays.
+    """
+    first = expiry.replace(day=1)
+    last_day = first - timedelta(days=1)                  # last day of the previous month
+    offset = (last_day.weekday() - EXPIRY_WEEKDAY[index]) % 7
+    return _previous_trading_day(last_day - timedelta(days=offset))
+
+
 def next_expiry(index: str, now: datetime) -> date:
     """Nearest weekly expiry that has not finished yet."""
     weekday = EXPIRY_WEEKDAY[index]

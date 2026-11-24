@@ -55,6 +55,31 @@ def main():
         a = cs.evaluate(fv, i, "nifty", 5, on)
         b = cs.evaluate(cs.compute_features(dv.iloc[: i + 1], "nifty", 5, None), i, "nifty", 5, on)
         assert (a["signal"], a.get("entry"), a["score"]) == (b["signal"], b.get("entry"), b["score"]), i
+    # --- futures volume: weights the VWAP, gives the volume ratio, and only for days that have it ---
+    days = list(dict.fromkeys(df0.index.normalize()))
+    fut = df0.copy()
+    fut["volume"] = 0
+    keep = fut.index.normalize() == days[10]                 # volume exists for ONE day only
+    fut.loc[keep, "volume"] = (np.arange(keep.sum()) % 5 + 1) * 100.0
+    ff = cs.compute_features(df0, "nifty", 5, None, fut)
+    d10 = ff[ff.index.normalize() == days[10]]
+    typ10 = (d10["high"] + d10["low"] + d10["close"]) / 3
+    w = fut.loc[keep, "volume"].values
+    assert np.allclose(d10["vwap"].values, (typ10.values * w).cumsum() / w.cumsum()), "VWAP is weighted by futures volume"
+    assert not d10["vwap_proxy"].any() and d10["vol_ratio"].notna().any()
+    other = ff[ff.index.normalize() == days[11]]
+    assert other["vwap_proxy"].all() and other["vol_ratio"].isna().all(), "days without volume use the plain average"
+    # the volume of a LATER candle never changes an earlier VWAP
+    cut = int(np.where(keep)[0][30])
+    ff2 = cs.compute_features(df0.iloc[: cut + 1], "nifty", 5, None, fut.iloc[: cut + 1])
+    assert abs(ff2["vwap"].iloc[-1] - ff["vwap"].iloc[cut]) < 1e-9, "VWAP looked at the future"
+    # nearest-contract window: the previous monthly expiry is the last expiry-weekday of last month
+    from datetime import date
+    import option_pricer as op
+    assert op.previous_monthly_expiry("nifty", date(2026, 12, 29)) == date(2026, 11, 23)     # 24 Nov is a holiday
+    assert op.previous_monthly_expiry("sensex", date(2026, 11, 26)) == date(2026, 10, 29)
+    print("OK: futures volume weights the VWAP per day, no look-ahead, contract window")
+
     # VWAP is on by default, volume and gap stay off
     assert cs.DEFAULT_FILTERS["vwap"] and not cs.DEFAULT_FILTERS["volume"] and not cs.DEFAULT_FILTERS["gap"]
     print("OK: VWAP / volume / gap features, no look-ahead, VWAP on by default")
