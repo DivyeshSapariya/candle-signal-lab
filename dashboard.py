@@ -318,6 +318,8 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         "candle_running": len(full) > len(finished),
         "candles": candles,
         "lines": lines,
+        "levels": {k: (None if pd.isna(last[k]) else round(float(last[k]), 2))
+                   for k in ("pdh", "pdl", "pdc", "or_high", "or_low", "swing_high", "swing_low")},
         "markers": markers,
         "latest": {
             "time": last_ts.strftime("%d %b %H:%M"),
@@ -663,6 +665,10 @@ PAGE = r"""<!DOCTYPE html>
   .change { font-size: 14px; font-weight: 600; font-family: var(--mono); }
   .legend { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; font-size: 12.5px; color: var(--soft); }
   .legend b { font-size: 12px; }
+  .chartopts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 8px; }
+  .chartopts .chip { min-height: 30px; padding: 0 10px; font-size: 12px; display: inline-flex; align-items: center; }
+  .chartopts .gap { flex: 1 1 8px; }
+  .chartopts .zl { font-size: 11px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; font-weight: 600; margin-right: 2px; }
   .lg { display: inline-block; width: 14px; height: 3px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
   #chart { height: clamp(300px, calc(100vh - 470px), 620px); border-radius: 6px; overflow: hidden; }
   .ftiles { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
@@ -881,12 +887,10 @@ PAGE = r"""<!DOCTYPE html>
             <span><b class="up">&#x25B2;</b> leans CE (up)</span>
             <span><b class="down">&#x25BC;</b> leans PE (down)</span>
             <span><b>&bull;</b> wait</span>
-            <span><i class="lg" style="background:#f3b94d"></i>VWAP</span>
-            <span><i class="lg" style="background:#4da3ff"></i>EMA 9</span>
-            <span><i class="lg" style="background:#b48bff"></i>EMA 21</span>
             <button class="btn" id="resetView" type="button">Reset view</button>
           </div>
         </div>
+        <div class="chartopts" id="chartOpts" role="group" aria-label="Chart options"></div>
         <div id="chart"></div>
         <div class="ftiles" id="factTiles"></div>
       </section>
@@ -1046,13 +1050,103 @@ const lineOpts = (color, width, style) => ({ color: color, lineWidth: width, lin
 const ema9Series = chart.addLineSeries(lineOpts(LINE_COLORS.ema9, 1, 0));
 const ema21Series = chart.addLineSeries(lineOpts(LINE_COLORS.ema21, 1, 0));
 let vwapSeries = [];
+// what is drawn on the chart (each can be switched on / off; remembered between visits)
+const CHART_OPTS = [
+  { key: 'vwap', label: 'VWAP', color: '#f3b94d', on: true },
+  { key: 'ema9', label: 'EMA 9', color: '#4da3ff', on: true },
+  { key: 'ema21', label: 'EMA 21', color: '#b48bff', on: true },
+  { key: 'prev', label: 'Previous day', color: '#9aa8b6', on: false },
+  { key: 'orange', label: 'Opening range', color: '#7ee8d6', on: false },
+  { key: 'swing', label: 'Swing high / low', color: '#6d8bb0', on: false },
+  { key: 'walls', label: 'OI walls', color: '#ff7a70', on: false },
+  { key: 'arrows', label: 'Pattern arrows', color: '#2bd4b4', on: true },
+  { key: 'signal', label: 'Signal candle', color: '#f3b94d', on: true },
+  { key: 'ideas', label: 'Past ideas', color: '#c9d3df', on: true },
+];
+const opts = {};
+CHART_OPTS.forEach((o) => { opts[o.key] = store.get('cs.opt.' + o.key, o.on ? '1' : '0') === '1'; });
+let lastData = null, levelLines = [];
 function setIndicatorLines(l) {
   ema9Series.setData(l.ema9); ema21Series.setData(l.ema21);
   while (vwapSeries.length > l.vwap.length) chart.removeSeries(vwapSeries.pop());
   while (vwapSeries.length < l.vwap.length) vwapSeries.push(chart.addLineSeries(lineOpts(LINE_COLORS.vwap, 2, 2)));
   l.vwap.forEach((points, i) => vwapSeries[i].setData(points));
+  applyChartOpts();
+}
+// marks for the idea shown now (signal + confirmation candle) and for the ideas saved in the journal
+const chartTime = (iso) => Math.round(Date.parse(iso) / 1000) + 19800;
+const IDEA_COLORS = { 'SUCCESS': '#2bd4b4', 'FAILED': '#ff7a70', 'TIME EXIT': '#f3b94d' };
+function ideaMarkers() {
+  const out = [];
+  const p = lastData && lastData.plan;
+  if (opts.signal && p && p.signal !== 'NONE' && p.signal_time) {
+    out.push({ time: chartTime(p.signal_time), position: 'inBar', shape: 'square', color: '#f3b94d', size: 1, text: 'signal' });
+    if (p.mode === 'confirm' && p.decision_time && p.decision_time !== p.signal_time) {
+      out.push({ time: chartTime(p.decision_time), position: 'inBar', shape: 'circle', color: '#7ee8d6', size: 1, text: 'confirm' });
+    }
+  }
+  if (opts.ideas && histData) {
+    histData.items.forEach((it) => {
+      if (it.index !== state.index.toUpperCase() || it.interval !== state.interval || it.label === 'SKIPPED') return;
+      out.push({ time: chartTime(it.sort), position: it.side === 'CE' ? 'belowBar' : 'aboveBar', shape: 'square',
+        color: IDEA_COLORS[it.label] || '#9aa8b6', size: 1,
+        text: it.side + ' ' + (it.r_net === null ? '\u2026' : rUnit(it.r_net)) });
+    });
+  }
+  return out;
+}
+function applyChartOpts() {
+  ema9Series.applyOptions({ visible: opts.ema9 });
+  ema21Series.applyOptions({ visible: opts.ema21 });
+  vwapSeries.forEach((x) => x.applyOptions({ visible: opts.vwap }));
+  const marks = (lastData && opts.arrows ? lastData.markers : []).concat(lastData ? ideaMarkers() : []);
+  series.setMarkers(marks.sort((a, b) => a.time - b.time));
+  levelLines.forEach((x) => series.removePriceLine(x));
+  levelLines = [];
+  if (!lastData) return;
+  const lv = lastData.levels || {}, ch = lastData.chain;
+  const add = (price, color, title, style) => {
+    if (price === null || price === undefined) return;
+    levelLines.push(series.createPriceLine({ price: price, color: color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title: title }));
+  };
+  if (opts.prev) { add(lv.pdh, '#9aa8b6', 'PD high', 2); add(lv.pdl, '#9aa8b6', 'PD low', 2); add(lv.pdc, '#9aa8b6', 'PD close', 1); }
+  if (opts.orange) { add(lv.or_high, '#7ee8d6', 'OR high', 2); add(lv.or_low, '#7ee8d6', 'OR low', 2); }
+  if (opts.swing) { add(lv.swing_high, '#6d8bb0', 'Swing high', 1); add(lv.swing_low, '#6d8bb0', 'Swing low', 1); }
+  if (opts.walls && ch) {
+    if (ch.call_wall) add(ch.call_wall.strike, '#ff7a70', 'Call wall', 3);
+    if (ch.put_wall) add(ch.put_wall.strike, '#2bd4b4', 'Put wall', 3);
+  }
+}
+function buildChartOpts() {
+  const box = clear($('chartOpts'));
+  CHART_OPTS.forEach((o) => {
+    const b = h('button', 'chip', null, [h('i', 'lg'), document.createTextNode(o.label)]);
+    b.type = 'button';
+    b.firstChild.style.background = o.color;
+    b.setAttribute('aria-pressed', String(opts[o.key]));
+    b.addEventListener('click', () => {
+      opts[o.key] = !opts[o.key];
+      store.set('cs.opt.' + o.key, opts[o.key] ? '1' : '0');
+      b.setAttribute('aria-pressed', String(opts[o.key]));
+      applyChartOpts();
+    });
+    box.appendChild(b);
+  });
+  box.appendChild(h('span', 'gap'));
+  box.appendChild(h('span', 'zl', 'Zoom'));
+  [['50', 50], ['100', 100], ['All', 0]].forEach(([label, n]) => {
+    const b = h('button', 'chip', label);
+    b.type = 'button';
+    b.addEventListener('click', () => {
+      if (n === 0) chart.timeScale().fitContent();
+      else chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, lastN - n), to: lastN + 5 });
+    });
+    box.appendChild(b);
+  });
 }
 let detailChart = null, detailSeries = null;
+
+buildChartOpts();
 
 function applyTheme(t) {
   theme = t;
@@ -1576,6 +1670,7 @@ async function loadHistory() {
     if (j === lastHistJson) return;           // nothing changed, do not redraw
     lastHistJson = j; histData = d;
     renderHistory(); renderLearned();
+    applyChartOpts();
   } catch (e) { /* the dashboard keeps working without history */ }
 }
 
@@ -1604,8 +1699,8 @@ async function load() {
     if (!res.ok) { showError(d.error || 'Could not get data.'); return; }
     hideError();
     series.setData(d.candles);
-    series.setMarkers(d.markers);
-    if (d.lines) setIndicatorLines(d.lines);
+    lastData = d;
+    if (d.lines) setIndicatorLines(d.lines); else applyChartOpts();
     lastN = d.candles.length;
     if (needFit) { fitRecent(); needFit = false; }
     render(d);

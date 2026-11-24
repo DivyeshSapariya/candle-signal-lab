@@ -23,13 +23,13 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `candle_memory.py` | The tool's memory: remembers how every finished idea ended, recalls similar past ideas, writes lessons. |
 | `live_monitor.py` | Text-only live watcher (simple version). |
 | `candle_store.py` | Your own candle database. Saves NIFTY / SENSEX candles and India VIX into `market_data.db`. Can also download a year of history, the futures volume and the option chain (open interest) from Angel One (see section 3b). |
-| `candle_analysis.py` | Explains the decision for the dashboard: the 4-step "Live analysis" card and the list of recent setups that were dropped, and why (section 3). It adds no rules. |
+| `candle_analysis.py` | Explains the decision for the dashboard: the four "Live analysis" steps in the decision banner and the list of recent setups that were dropped, and why (section 3). It adds no rules. |
 | `candle_chain.py` | Turns option open interest into the plain facts of the dashboard's Option chain card (put/call ratio, walls, change), and builds the open-interest features for the optional `oi_*` checks (section 5). |
 | `candle_research.py` | Honest checks on your saved candles: walk-forward blocks, cost stress, uncertainty range, breakdowns, extra checks (section 7c). |
 | `strategy_lab.py` | Tests other strategy types (opening-range breakout, VWAP pullback, trend continuation, mean reversion) on your saved candles against a strict pass/fail gate (section 7d). Changes no live rules. |
 | `candle_baseline.py` | Reality check: compares the strategy with random entries (same exits, costs and stop sizes) to see if it beats chance (see section 7b). |
 | `test_no_lookahead.py` | Safety test: checks that the rules never use the future. |
-| `test_candle_analysis.py` | Checks that the Live analysis card always agrees with the real decision. |
+| `test_candle_analysis.py` | Checks that the Live analysis steps always agree with the real decision. |
 | `test_candle_research.py` | Checks the research maths, and the VWAP / volume / gap features (no look-ahead). |
 | `test_strategy_lab.py` | Checks the strategy lab: no look-ahead, same simulator and costs as the main backtest, and that random data fails the gate. |
 | `test_candle_chain.py` | Checks the open-interest facts (last value per day, previous session, walls, edge cases). |
@@ -96,22 +96,37 @@ Stop any of them with **Ctrl + C**.
 
 **Auto-reload:** you do not need to stop and start the dashboard after changing the code. When any `.py` file in the project changes, the server restarts by itself and the page open in your browser refreshes itself a moment later (it may show "Cannot reach the dashboard server" for a second or two while the server restarts). Only `.py` files trigger it; changes to this README or to the data files (`trade_journal.csv`, `market_data.db`) do not. A dashboard that was started before auto-reload existed does not have it: stop it once with Ctrl + C and start it again. Use `--no-reload` if you want the old behaviour (the server never restarts by itself).
 
-In the page: use the buttons at the top to pick NIFTY / SENSEX and 1 / 5 / 15 minute candles, and the drop-down to pick the data source (Angel One when its four values are in your `.env`, otherwise Yahoo; see section 9). The page remembers your choices, and the moon / sun button switches between dark and light theme. It refreshes every 15 seconds. The chart library loads from the internet, so you need internet. If a refresh fails (for example Angel One is busy), the page keeps the last good numbers for up to 5 minutes and tries again by itself.
+In the page: use the buttons at the top to pick NIFTY / SENSEX and 1 / 5 / 15 minute candles, and the drop-down to pick the data source (Angel One when its four values are in your `.env`, otherwise Yahoo; see section 9). The page remembers your choices, and the moon / sun button switches between dark and light theme. It refreshes every 15 seconds. The chart library and the fonts (Inter, JetBrains Mono) load from the internet, so you need internet; without it the page falls back to system fonts only if the chart library was already cached. If a refresh fails (for example Angel One is busy), the page keeps the last good numbers for up to 5 minutes and tries again by itself.
 
-**Page layout (compact, made to fit one screen):**
-- **Top bar:** title, market and data status (open / closed, data up to date or delayed), the time of the last update, and the controls, all in one row (two rows on a narrow window).
-- **Decision banner:** the answer first. It says "No trade right now", or "Buy CE (call) idea" / "Buy PE (put) idea" with three tiles for BUY price, STOP LOSS and TARGET. A small "Practice only" tag appears when the market is closed or the data is delayed.
-- **Chart:** price and change, the CE / PE legend and a "Reset view" button share one line above the chart. When there is an idea, dashed ENTRY, STOP LOSS and TARGET lines are drawn on it.
-- **Live analysis:** how the tool reaches its decision, in 4 steps: 1. Pattern, 2. Confirmation, 3. Filters, 4. Agreement. Each is a green ✔ or red ✘ box (hover for the detail, or an "..." box when it is not reached yet). Under it: one sentence saying where the decision stands, the facts the tool sees (VWAP and whether the price is above or below it, the opening gap, the volume against its average) and, while the market is open, when the next candle closes.
-- **Option chain (open interest):** put/call OI ratio, the call wall and put wall (strikes with the most call / put OI among the 11 strikes around the index level), a bar per strike with its OI and the change since the previous session, and a few plain sentences (where the index sits between the walls). With Angel One it uses the current OI (one read-only request, cached for a minute); with Yahoo, or if that fails, it shows the last saved day (section 3b). It says "live" or "saved" in its heading. **Facts only: no rule or alert uses it.**
-- **Recent setups with no idea:** the last 8 times a pattern appeared but no idea was made, each with the first rule that said no (for example "15 min trend DOWN, 60 min trend UP - does not agree"). This shows why you see so few ideas. On a wide screen it sits under the chart.
-- **Why this decision:** the checklist, split into "Must pass" and "Bonus points", with the agreement meter.
-- **Trade details** (only when there is an idea): the option, the index levels, the memory note and "How to place this trade". That last box starts closed; click it to open the steps.
-- **Latest finished candle** and **Recent candle patterns:** the open / high / low / close, the pattern and what it means, and a short list of recent patterns.
-- **Paper-trade scoreboard:** ideas, win rate and net result, plus the latest ideas.
-- **Idea history** and **What the tool learned** are below. Click a row in the history to open its story, prices and chart.
+**Page layout (three tiers, dark colours with a light theme):**
+- **Top bar:** logo and title, market and data status (open / closed, data up to date or delayed), the time of the last update, and the controls, in one row (it wraps on a narrow window).
+- **Decision banner (the answer first):** a round status icon (amber for no trade, green for CE, red for PE), the title ("No trade right now", or "Buy CE (call) idea" / "Buy PE (put) idea") and one sentence. On the right are the four steps of the **Live analysis**: 1. Pattern, 2. Confirmation, 3. Filters, 4. Agreement, each a Pass / Fail card (hover for the detail) with one line saying where the decision stands and, while the market is open, when the next candle closes. When there is an idea, the BUY price, STOP LOSS and TARGET tiles show there too. A "Practice only" tag appears when the market is closed or the data is delayed, and a strip along the bottom explains why waiting is normal.
+- **Tier 1, the chart** (left) with **Why this decision** (right: the checklist split into "Must pass" and "Bonus points", with the agreement meter; **Trade details** appears below it only when there is an idea: the option, the index levels, the memory note and "How to place this trade", which starts closed).
+  - Above the chart: price and change, the CE / PE legend, "Reset view", a row of chart options (below) and zoom presets (last 50 candles, last 100, All).
+  - When there is an idea, dashed ENTRY, STOP LOSS and TARGET lines are drawn on the chart.
+  - Under the chart, one tile per fact: VWAP (and whether the price is above or below), the opening gap, volume against its average, and from the option chain the put/call OI ratio, the call wall and the put wall.
+- **Tier 2, context:** **Latest finished candle** (a small drawing of the candle, open / high / low / close, colour, trend before, and the pattern with its meaning) and **Recent candle patterns**; the **Option chain (open interest)** card; and the **Paper-trade scoreboard** (ideas, win rate, net result, latest ideas).
+  - Option chain: a bar per strike for calls (red) and puts (green) with the OI and its change since the previous session, the strike nearest the index highlighted, and a few plain sentences (where the index sits between the walls). With Angel One it uses the current OI (one read-only request, cached for a minute); with Yahoo, or if that fails, the last saved day (section 3b). The heading says "live" or "saved". **Facts only: no rule or alert uses it.**
+- **Tier 3, track record:** **Idea history** and **What the tool learned** (tabs in one card; click a row in the history to open its story, prices and chart), and **Recent setups with no idea**: the last 8 times a pattern appeared but no idea was made, each with the first rule that said no (for example "15 min trend DOWN, 60 min trend UP - does not agree"). This shows why you see so few ideas.
+- A collapsed **Quick guide** and a short safety note finish the page.
 
-The columns follow the size of your window. On a wide screen (about 1500 px and more) it is three columns in one row (chart, checklist and trade, candle and scoreboard) and the chart is as tall as the window. On a medium window the chart and candle row are on the left and the checklist and scoreboard on the right. On a narrow window or a phone it is one column. When an idea is showing, the right-hand column is longer than one screen, so scroll a little to see the scoreboard.
+**Chart options.** A row of buttons above the chart switches each item on or off; the page remembers your choice. Indicator lines come from the server and use only finished candles.
+
+| Option | Shows | Default |
+|---|---|---|
+| VWAP | The day's VWAP (dashed amber), one piece per day because it restarts every morning. Volume-weighted when futures volume is saved, otherwise the plain average price of the day, as in the rules | On |
+| EMA 9, EMA 21 | The two moving averages the rules use (blue and purple) | On |
+| Previous day | Yesterday's high, low and close | Off |
+| Opening range | High and low of the first 30 minutes (shown once the range is final) | Off |
+| Swing high / low | The recent swing levels the key-level check uses | Off |
+| OI walls | The call wall and put wall as price lines (same strikes as the option chain card) | Off |
+| Pattern arrows | The CE / PE arrows and pattern names | On |
+| Signal candle | When an idea is active, a square on the signal candle ("signal") and a circle on the confirmation candle ("confirm") | On |
+| Past ideas | Every journal idea for the market and candle size on screen, on its signal candle, labelled with the side and result (for example "CE +1.90R"), green for success, red for failed, amber for time exit, grey for waiting | On |
+
+Past ideas older than the visible range appear when you zoom out (press "All"). None of these options changes a rule or an alert.
+
+The page is made of flexible rows, so it follows the size of your window: the chart and the checklist share a row on a wide screen, and everything stacks into one column on a phone.
 
 ### Backtest options
 | Option | Meaning | Example |
@@ -319,7 +334,7 @@ Think of a doctor: he does not diagnose from one symptom. He checks several test
 
 The three `oi_*` checks use the saved option-chain history (section 3b), with fixed untuned thresholds. A candle uses only OI bars that had finished before it closed, and a candle with no recent OI (older than 20 minutes, or fewer than 6 strikes per side) simply skips the check. **They do nothing in the live dashboard**, which does not compute these features: switching one on in `DEFAULT_FILTERS` only affects research and backtests that pass the saved option table to `compute_features(..., chain=load_option_chain(index))`.
 
-Switch them in `DEFAULT_FILTERS` and let `candle_research.py` (section 7c) judge the change. Volume and gap are also shown as plain facts in the Live analysis card whether or not the check is on.
+Switch them in `DEFAULT_FILTERS` and let `candle_research.py` (section 7c) judge the change. Volume and gap are also shown as plain fact tiles under the chart whether or not the check is on.
 
 **Step 3. Points (need 3 of 4).**
 - +2 clear pattern
