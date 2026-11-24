@@ -30,10 +30,12 @@ import candle_journal as journal
 import candle_memory
 import telegram_notify as tg
 from candle_patterns import PATTERN_INFO
-from data_sources import (IST, INTERVAL_MINUTES, angel_futures, angel_too_fast, drop_forming_candle, fetch_angel_future,
-                          fetch_angel_option, get_candles)
+from data_sources import (IST, INTERVAL_MINUTES, angel_futures, angel_option_contracts, angel_too_fast, drop_forming_candle,
+                          fetch_angel_future, fetch_angel_option, fetch_angel_option_oi, get_candles)
 from option_pricer import build_option_levels, get_vix_daily
 from candle_analysis import live_analysis, rejected_setups
+import candle_chain
+import candle_store
 from candle_signals import compute_features
 from live_monitor import market_is_open
 from trade_plan import build_trade_plan
@@ -90,6 +92,45 @@ def _live_futures(index: str, interval: str):
         df = None
     _future_cache[key] = (time.time(), df)
     return df
+
+
+_chain_cache = {}
+CHAIN_CACHE_SECONDS = 60
+
+
+def _option_chain(source: str, index: str, spot: float):
+    """
+    Open-interest facts for the card. With Angel One: the CURRENT OI of the contracts around the index
+    level (one read-only request, cached for a minute), compared with the last saved session. Otherwise,
+    or if that fails: the last saved day (python candle_store.py backfill-options). None when nothing exists.
+    """
+    key = (source, index)
+    cached = _chain_cache.get(key)
+    if cached and time.time() - cached[0] < CHAIN_CACHE_SECONDS:
+        return cached[1]
+    result = None
+    try:
+        saved = candle_store.load_option_chain(index)
+    except Exception as error:
+        print(f"[chain] saved data not readable: {error}")
+        saved = None
+    if source == "angel":
+        try:
+            contracts = angel_option_contracts(index, spot)
+            oi, traded = fetch_angel_option_oi(contracts)
+            current = {(c["strike"], c["side"]): oi[c["token"]] for c in contracts if c["token"] in oi}
+            expiry = contracts[0]["expiry"].isoformat()
+            before = candle_chain.previous_session(saved, expiry, datetime.now(IST).date()) if saved is not None else {}
+            result = candle_chain.summarize(current, before, spot, expiry, "live", traded or "now")
+        except Exception as error:
+            print(f"[chain] live open interest not available: {error}")
+    if result is None and saved is not None:
+        snap = candle_chain.saved_snapshot(saved)
+        if snap:
+            expiry, current, before, day = snap
+            result = candle_chain.summarize(current, before, spot, expiry, "saved", day)
+    _chain_cache[key] = (time.time(), result)
+    return result
 
 
 def build_payload(source: str, index: str, interval: str) -> dict:
@@ -171,6 +212,12 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         print(f"[analysis] problem: {error}")
         analysis = None
 
+    try:
+        chain = _option_chain(source, index, current_price)
+    except Exception as error:                          # a side card must never break the dashboard
+        print(f"[chain] problem: {error}")
+        chain = None
+
     # Convert index levels into OPTION price levels (what you actually buy / sell)
     if plan["signal"] != "NONE":
         live_price, live_expiry = None, None
@@ -249,6 +296,7 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         "learning_only": (not market_open) or delayed,
         "plan": plan,
         "analysis": analysis,
+        "chain": chain,
         "journal": journal_summary,
         "last_price": current_price,
         "prev_price": float(full["close"].iloc[-2]) if len(full) > 1 else None,
@@ -658,6 +706,17 @@ PAGE = r"""<!DOCTYPE html>
   .learn-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; margin-top: 8px; }
   .learn-grid .card { box-shadow: none; background: var(--surface2); }
 
+  .oi-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-bottom: 6px; }
+  .oi-row { display: grid; grid-template-columns: minmax(0, 1fr) 52px minmax(0, 1fr); gap: 6px; align-items: center;
+            font-size: 11px; padding: 1px 0; font-variant-numeric: tabular-nums; }
+  .oi-row .stk { text-align: center; font-weight: 700; }
+  .oi-row.near .stk { text-decoration: underline; }
+  .oi-bar { height: 12px; border-radius: 3px; min-width: 1px; opacity: .75; }
+  .oi-bar.ce { background: var(--red); }
+  .oi-bar.pe { background: var(--green); }
+  .oi-cell { display: flex; align-items: center; gap: 4px; min-width: 0; white-space: nowrap; }
+  .oi-cell.ce { justify-content: flex-end; }
+  .oi-head { color: var(--muted); font-weight: 700; }
   .guide { margin-top: 12px; }
   .guide ul { margin: 0; padding-left: 20px; } .guide li { padding: 2px 0; }
   footer { padding: 10px 0 20px; color: var(--muted); font-size: 12px; }
@@ -794,6 +853,10 @@ PAGE = r"""<!DOCTYPE html>
         <div class="steps" id="anSteps"></div>
         <div id="stepNote" class="muted">--</div>
         <div id="anFacts" class="muted small" style="margin-top:4px"></div>
+      </section>
+      <section class="card" id="cardChain">
+        <h3>Option chain (open interest) <span class="hint" id="oiMeta"></span></h3>
+        <div id="oiBody" class="muted">--</div>
       </section>
       <section class="card" id="cardWhy">
         <h3>Why this decision</h3>
@@ -1020,6 +1083,37 @@ function renderAnalysis(d) {
   });
 }
 
+// ---------------- option chain: open interest facts ----------------
+function renderChain(d) {
+  const c = d.chain, box = clear($('oiBody')), meta = $('oiMeta');
+  meta.textContent = '';
+  if (!c) { box.className = 'muted'; box.textContent = 'No option data yet. Run: python candle_store.py backfill-options'; return; }
+  box.className = '';
+  meta.textContent = '\u00B7 expiry ' + c.expiry + ' \u00B7 ' + (c.source === 'live' ? 'live ' + c.as_of : 'saved ' + c.as_of);
+  const oi = (n) => n >= 1e5 ? (n / 1e5).toFixed(1) + 'L' : n >= 1e3 ? (n / 1e3).toFixed(0) + 'k' : String(Math.round(n));
+  const sgn = (n) => (n > 0 ? '+' : n < 0 ? '-' : '') + oi(Math.abs(n));
+  const tiles = h('div', 'oi-tiles');
+  tiles.appendChild(tile('', 'Put/call OI', c.pcr === null ? '--' : c.pcr.toFixed(2), ''));
+  tiles.appendChild(tile('', 'Call wall', c.call_wall ? String(c.call_wall.strike) : '--', 'most call OI'));
+  tiles.appendChild(tile('', 'Put wall', c.put_wall ? String(c.put_wall.strike) : '--', 'most put OI'));
+  box.appendChild(tiles);
+  const max = Math.max(1, ...c.rows.map((r) => Math.max(r.ce || 0, r.pe || 0)));
+  let near = c.rows[0];
+  c.rows.forEach((r) => { if (Math.abs(r.strike - c.spot) < Math.abs(near.strike - c.spot)) near = r; });
+  box.appendChild(h('div', 'oi-row oi-head', null, [h('div', null, 'Calls (CE)'), h('div', 'stk', 'Strike'), h('div', null, 'Puts (PE)')]));
+  c.rows.forEach((r) => {
+    const cell = (side) => {
+      const v = r[side], chg = r[side + '_chg'];
+      const bar = h('div', 'oi-bar ' + side);
+      bar.style.width = (v ? Math.max(2, v / max * 100) * 0.5 : 0) + '%';
+      const txt = h('span', null, v === null ? '--' : oi(v) + (chg === null ? '' : ' (' + sgn(chg) + ')'));
+      return h('div', 'oi-cell ' + side, null, side === 'ce' ? [txt, bar] : [bar, txt]);
+    };
+    box.appendChild(h('div', 'oi-row' + (r === near ? ' near' : ''), null, [cell('ce'), h('div', 'stk', String(r.strike)), cell('pe')]));
+  });
+  box.appendChild(h('div', 'muted small', null, c.facts.map((f) => h('div', null, f))));
+}
+
 // ---------------- why (checklist) ----------------
 function renderWhy(d) {
   const p = d.plan, box = clear($('why'));
@@ -1180,6 +1274,7 @@ function render(d) {
 
   renderDecision(d);
   renderAnalysis(d);
+  renderChain(d);
   renderWhy(d);
   renderTrade(d);
   renderJournal(d.journal);

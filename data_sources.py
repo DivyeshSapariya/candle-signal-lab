@@ -335,6 +335,24 @@ def angel_option_contracts(index: str, spot: float, strikes: int = 5, now: datet
     return sorted((r for r in rows if r["strike"] in keep), key=lambda r: (r["strike"], r["side"]))
 
 
+def fetch_angel_option_oi(contracts: list) -> tuple:
+    """
+    Current open interest of option contracts (one read-only request for all of them).
+    Returns ({token: oi}, "dd-Mon-yyyy HH:MM:SS" time of the newest trade seen or "").
+    """
+    client = _angel_login()
+    by_exchange = {}
+    for c in contracts:
+        by_exchange.setdefault(c["exchange"], []).append(c["token"])
+    res = _angel_request(lambda: client.getMarketData("FULL", by_exchange))
+    if not (res or {}).get("status"):
+        raise RuntimeError(f"Angel One option OI failed: {str(res)[:200]}")
+    rows = (res.get("data") or {}).get("fetched") or []
+    oi = {str(r["symbolToken"]): float(r["opnInterest"]) for r in rows if r.get("opnInterest") is not None}
+    times = [str(r.get("exchTradeTime") or "") for r in rows if r.get("exchTradeTime")]
+    return oi, (max(times, key=lambda t: datetime.strptime(t, "%d-%b-%Y %H:%M:%S")) if times else "")
+
+
 def fetch_angel_option_history(contract: dict, start: datetime, end: datetime) -> pd.DataFrame:
     """
     5-minute history of ONE option contract: close, volume (from the candles) and open interest
