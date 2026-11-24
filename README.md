@@ -4,7 +4,7 @@ A personal tool that reads NIFTY50 and SENSEX candles, finds candle patterns, ch
 
 For personal use only. This is not financial advice. No tool can predict the market. A signal is a "chance", not a promise.
 
-**Status: Round 1 done (free, no broker account needed).**
+**Status: Round 1 done (free, no broker account needed). Round 2 is mostly in place: Angel One live data, one year of saved candles, real option prices and futures volume. The rules still show no proven edge, see section 7c.**
 
 ---
 
@@ -16,22 +16,27 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `candle_signals.py` | The brain. Filters + rules that decide CE / PE / No trade, with entry, stop loss, target. Used by the dashboard AND the backtest, so both follow the same rules. |
 | `trade_plan.py` | Small live layer: where the price is now compared with the plan. |
 | `option_pricer.py` | Turns index levels into option (CE/PE) buy price, stop loss price, target price. |
-| `data_sources.py` | Gets candles from free sources (Yahoo Finance or Angel One). |
+| `data_sources.py` | Gets candles from Yahoo Finance or Angel One (live candles, futures with volume, option prices). All Angel One requests go through one queue with pauses and retries (section 9). |
 | `dashboard.py` | Live chart + analysis in your browser. |
 | `candle_backtest.py` | Tests the rules on past candles. |
 | `candle_journal.py` | Idea history: saves every idea, checks later how it ended (success / failed), writes the story and saves a chart. |
 | `candle_memory.py` | The tool's memory: remembers how every finished idea ended, recalls similar past ideas, writes lessons. |
 | `live_monitor.py` | Text-only live watcher (simple version). |
-| `candle_store.py` | Your own candle database. Saves NIFTY / SENSEX candles and India VIX into `market_data.db` so you build a long history (see section 3b). |
+| `candle_store.py` | Your own candle database. Saves NIFTY / SENSEX candles and India VIX into `market_data.db`. Can also download a year of history and the futures volume from Angel One (see section 3b). |
+| `candle_analysis.py` | Explains the decision for the dashboard: the 4-step "Live analysis" card and the list of recent setups that were dropped, and why (section 3). It adds no rules. |
+| `candle_research.py` | Honest checks on your saved candles: walk-forward blocks, cost stress, uncertainty range, breakdowns, extra checks (section 7c). |
 | `candle_baseline.py` | Reality check: compares the strategy with random entries (same exits, costs and stop sizes) to see if it beats chance (see section 7b). |
 | `test_no_lookahead.py` | Safety test: checks that the rules never use the future. |
+| `test_candle_analysis.py` | Checks that the Live analysis card always agrees with the real decision. |
+| `test_candle_research.py` | Checks the research maths, and the VWAP / volume / gap features (no look-ahead). |
+| `test_candle_backfill.py` | Checks the Angel One downloader and the rate-limit handling with a fake Angel One (no login, no internet). |
 | `telegram_notify.py` | Sends a short Telegram message when a new idea appears and when it ends (see section 3c). Also has the setup helpers `--check`, `--test` and `--find-chat`. |
 | `test_telegram_notify.py` | Tests the Telegram alerts with a fake Telegram, so no real bot is needed. |
-| `.env.example` | Template for your private Telegram settings. Copy it to `.env` and fill in your values (section 3c). |
+| `.env.example` | Template for your private settings (Telegram, Angel One). Copy it to `.env` and fill in your values (sections 3c and 9). |
 | `requirements.txt` | The packages the project needs (`pip install -r requirements.txt`). |
 | `README.md` | This document. |
 
-Files created by the tool: `trade_journal.csv` (idea history), `trade_snapshots/` (a small chart of every finished idea), `trade_memory.csv` (the memory), `market_data.db` (your saved candles), `backtest_trades.csv` (only if you use `--save`), a `.cache` folder (only with Angel One), and `.env` (you create it yourself from `.env.example` for Telegram; it holds your private token and is never uploaded to Git). Do not delete `trade_journal.csv`, `trade_snapshots/`, `trade_memory.csv` and `market_data.db` if you want to keep your history, memory and candle data.
+Files created by the tool: `trade_journal.csv` (idea history), `trade_snapshots/` (a small chart of every finished idea), `trade_memory.csv` (the memory), `market_data.db` (your saved candles), `backtest_trades.csv` (only if you use `--save`), a `.cache` folder and a `logs` folder (only with Angel One; the Angel One library writes request logs there, which can contain your API key, so both are ignored by Git), and `.env` (you create it yourself from `.env.example`; it holds your private Telegram token and Angel One values and is never uploaded to Git). Do not delete `trade_journal.csv`, `trade_snapshots/`, `trade_memory.csv` and `market_data.db` if you want to keep your history, memory and candle data.
 
 The `.venv` folder (created in section 2) holds the installed packages for this project only. It can be deleted and rebuilt at any time.
 
@@ -66,11 +71,15 @@ Tip: you do not have to activate the environment. You can also run any command w
 | Text-only live watcher | `python live_monitor.py` |
 | Quick test with sample candles | `python candle_patterns.py` |
 | Save today's candles to your database | `python candle_store.py collect` |
+| Download a year of history from Angel One | `python candle_store.py backfill --days 365` |
+| Save futures candles (real volume) from Angel One | `python candle_store.py backfill-futures` |
 | See what the database holds | `python candle_store.py status` |
 | Does the strategy beat random entries? | `python candle_baseline.py` |
+| Walk-forward, cost stress, uncertainty and extra checks on your saved data | `python candle_research.py` |
 | Check that the rules never use the future | `python test_no_lookahead.py` |
 | Telegram: check the settings / send a test message / find the group id | `python telegram_notify.py --check` / `--test` / `--find-chat` |
 | Test the Telegram alerts (no real bot needed) | `python test_telegram_notify.py` |
+| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py` |
 
 Stop any of them with **Ctrl + C**.
 
@@ -79,12 +88,14 @@ Stop any of them with **Ctrl + C**.
 
 **Auto-reload:** you do not need to stop and start the dashboard after changing the code. When any `.py` file in the project changes, the server restarts by itself and the page open in your browser refreshes itself a moment later (it may show "Cannot reach the dashboard server" for a second or two while the server restarts). Only `.py` files trigger it; changes to this README or to the data files (`trade_journal.csv`, `market_data.db`) do not. A dashboard that was started before auto-reload existed does not have it: stop it once with Ctrl + C and start it again. Use `--no-reload` if you want the old behaviour (the server never restarts by itself).
 
-In the page: use the buttons at the top to pick NIFTY / SENSEX and 1 / 5 / 15 minute candles, and the drop-down to pick the data source. The page remembers your choices, and the moon / sun button switches between dark and light theme. It refreshes every 15 seconds. The chart library loads from the internet, so you need internet.
+In the page: use the buttons at the top to pick NIFTY / SENSEX and 1 / 5 / 15 minute candles, and the drop-down to pick the data source (Angel One when its four values are in your `.env`, otherwise Yahoo; see section 9). The page remembers your choices, and the moon / sun button switches between dark and light theme. It refreshes every 15 seconds. The chart library loads from the internet, so you need internet. If a refresh fails (for example Angel One is busy), the page keeps the last good numbers for up to 5 minutes and tries again by itself.
 
 **Page layout (compact, made to fit one screen):**
 - **Top bar:** title, market and data status (open / closed, data up to date or delayed), the time of the last update, and the controls, all in one row (two rows on a narrow window).
 - **Decision banner:** the answer first. It says "No trade right now", or "Buy CE (call) idea" / "Buy PE (put) idea" with three tiles for BUY price, STOP LOSS and TARGET. A small "Practice only" tag appears when the market is closed or the data is delayed.
 - **Chart:** price and change, the CE / PE legend and a "Reset view" button share one line above the chart. When there is an idea, dashed ENTRY, STOP LOSS and TARGET lines are drawn on it.
+- **Live analysis:** how the tool reaches its decision, in 4 steps: 1. Pattern, 2. Confirmation, 3. Filters, 4. Agreement. Each is a green ✔ or red ✘ box (hover for the detail, or an "..." box when it is not reached yet). Under it: one sentence saying where the decision stands, the facts the tool sees (VWAP and whether the price is above or below it, the opening gap, the volume against its average) and, while the market is open, when the next candle closes.
+- **Recent setups with no idea:** the last 8 times a pattern appeared but no idea was made, each with the first rule that said no (for example "15 min trend DOWN, 60 min trend UP - does not agree"). This shows why you see so few ideas. On a wide screen it sits under the chart.
 - **Why this decision:** the checklist, split into "Must pass" and "Bonus points", with the agreement meter.
 - **Trade details** (only when there is an idea): the option, the index levels, the memory note and "How to place this trade". That last box starts closed; click it to open the steps.
 - **Latest finished candle** and **Recent candle patterns:** the open / high / low / close, the pattern and what it means, and a short list of recent patterns.
@@ -114,7 +125,7 @@ Yahoo only gives about 60 days of 5-minute candles and 7 days of 1-minute candle
 
 - **Where:** `market_data.db` (SQLite, a normal file in this folder; no extra install).
 - **What is saved:** NIFTY and SENSEX at 1m, 5m and 15m (finished candles only), plus daily India VIX.
-- **Safe to repeat:** running it again updates candles that already exist and never makes duplicates.
+- **Safe to repeat:** running it again never makes duplicates. A candle that Yahoo already saved is kept as it is (Yahoo never overwrites saved candles, so it cannot replace the Angel One history); Angel One downloads do update saved candles.
 
 | What you want | Command |
 |---|---|
@@ -122,6 +133,8 @@ Yahoo only gives about 60 days of 5-minute candles and 7 days of 1-minute candle
 | Only one index or candle size | `python candle_store.py collect --index nifty --interval 5m` |
 | See what is stored (counts, dates, last run) | `python candle_store.py status` |
 | Export to a CSV file | `python candle_store.py export --index nifty --interval 5m --out nifty_5m.csv` |
+| Download up to a year of 5m and 15m candles from Angel One | `python candle_store.py backfill --days 365` (options `--index`, `--interval`) |
+| Save futures candles with real volume from Angel One | `python candle_store.py backfill-futures` |
 
 Use the saved history in your own code (same format as the live candles):
 
@@ -131,9 +144,25 @@ df = load_candles("nifty", "5m")
 vix = load_vix()
 ```
 
-**Daily schedule:** a Windows scheduled task named `AI-Trading-Candle-Collect` runs `candle_store.py collect` every Monday to Friday at 4:00 pm (after the market closes). If the PC was off at that time, it runs when the PC is next on and you are logged in. Run `collect` yourself at least once a week; if the PC is off for more than 7 days, those 1-minute candles are lost for good. To remove the task: `Unregister-ScheduledTask -TaskName "AI-Trading-Candle-Collect" -Confirm:$false` (PowerShell).
+**Daily schedule:** a Windows scheduled task named `AI-Trading-Candle-Collect` runs every Monday to Friday at 4:00 pm (after the market closes). It has two steps, one after the other: `candle_store.py collect` (Yahoo candles and India VIX) and `candle_store.py backfill-futures --days 5` (the futures volume, needs the Angel One values in `.env`). If one step fails, the other still runs. If the PC was off at that time, it runs when the PC is next on and you are logged in. Run `collect` yourself at least once a week; if the PC is off for more than 7 days, those 1-minute candles are lost for good. To remove the task: `Unregister-ScheduledTask -TaskName "AI-Trading-Candle-Collect" -Confirm:$false` (PowerShell).
 
-The backtest still downloads from Yahoo by default. To test on your saved history, load it with `load_candles` and pass it to `compute_features` and `run_backtest`, or export a CSV and use `candle_backtest.py --csv`.
+The backtest still downloads from Yahoo by default. To test on your saved history, load it with `load_candles` and pass it to `compute_features` and `run_backtest`, or export a CSV and use `candle_backtest.py --csv`. `candle_baseline.py` and `candle_research.py` already read the saved history.
+
+### Angel One history (`backfill`)
+
+Yahoo gives about 58 days of 5-minute candles. Angel One gives much more. `python candle_store.py backfill --days 365` downloads up to a year of 5m and 15m candles for NIFTY and SENSEX (1m only when you ask with `--interval 1m`).
+
+- It needs `ANGEL_API_KEY`, `ANGEL_CLIENT_ID`, `ANGEL_PIN` and `ANGEL_TOTP_SECRET` in your `.env` (section 9). It only reads candles; it never places an order.
+- It downloads in short pieces (60 days for 5m, 100 days for 15m), newest first, with a pause between requests because Angel One refuses fast requests. Each piece is saved straight away, so a stop in the middle loses nothing. Run it again any time.
+- After the first run you have about 248 trading days of 5m and 15m candles for both indexes (24 Nov 2025 to 23 Nov 2026 when it was run). Run it again from time to time to extend the history.
+
+### Futures volume (`backfill-futures`)
+
+The indexes themselves have no volume, so volume and a real VWAP come from the index **futures** (NIFTY and SENSEX), which Angel One serves with real volume.
+
+- `python candle_store.py backfill-futures` saves them as `NIFTY_FUT` and `SENSEX_FUT`. Each contract is saved only for the time it was the **nearest** one (from the day after the previous monthly expiry until its own expiry), because far-month contracts have very little volume and would give misleading numbers.
+- **Expired contracts cannot be downloaded.** So futures volume history cannot go back a year: it starts from the oldest contract that is still listed (about 17 days of SENSEX at the first run; NIFTY starts when its December contract became the nearest one). It then grows by itself through the daily schedule above. If you do not use the schedule, run `backfill-futures` at least once a month, before the contract expires, or that month's volume is lost for good.
+- The dashboard also fetches the nearest future live (cached for a minute) when the data source is Angel One, so VWAP and volume are real there.
 
 ---
 
@@ -212,7 +241,7 @@ Put them in `.env` or set them in the terminal (a value set in the terminal wins
 | `TELEGRAM_CHAT_ID` | Required. The group or chat that receives the messages. |
 | `TELEGRAM_ALLOW_DELAYED` | Alerts are also sent when the data is old (free Yahoo always is); the message then starts with a `DELAYED DATA` line. Set it to `0` to send nothing on old data. Default: alerts are sent. |
 | `ALERT_MARKETS` | The markets the loop watches. Default `nifty:5m,sensex:5m`. |
-| `ALERT_SOURCE` | `yahoo` (default) or `angel`. |
+| `ALERT_SOURCE` | `yahoo` or `angel`. Default: `angel` when the four `ANGEL_*` values are in `.env`, otherwise `yahoo`. |
 
 ### Cautions
 
@@ -256,6 +285,16 @@ Think of a doctor: he does not diagnose from one symptom. He checks several test
 | Expiry afternoon | No new trades on expiry day after 1:00 pm | Options become wild |
 | India VIX | Skip when previous-day VIX is above 22 | Too wild, options too expensive |
 | Lunch time (off by default) | Skip 12:00 to 1:30 pm | You can switch it on and let the backtest judge |
+
+**Extra checks (VWAP is on; volume and gap are off).**
+
+| Check | What it means | State |
+|---|---|---|
+| VWAP | CE only when the price is above today's VWAP, PE only when it is below. VWAP = today's average price weighted by the **futures** volume. On a day with no volume data it is the plain average price of the day, and the checklist says "average price of the day" instead of VWAP. | **On** |
+| Volume | The candle's futures volume must be at least its recent 20-candle average. | Off. Not enough futures history yet to judge it. |
+| Opening gap | Not trading against a gap bigger than 0.3% (for example a CE after a gap down). | Off. Helped some markets and hurt others in the tests. |
+
+Switch them in `DEFAULT_FILTERS` and let `candle_research.py` (section 7c) judge the change. Volume and gap are also shown as plain facts in the Live analysis card whether or not the check is on.
 
 **Step 3. Points (need 3 of 4).**
 - +2 clear pattern
@@ -350,6 +389,29 @@ Result on the first 58 days of saved data (27 Aug to 20 Nov 2026): the strategy 
 
 ---
 
+## 7c. Honest checks on your saved data (`candle_research.py`)
+
+Run `python candle_research.py` (options `--index nifty|sensex`, `--interval 5m|15m`). It reads `market_data.db`, writes nothing and changes no rules. For each market it prints:
+
+1. **Walk-forward:** the same rules on 4 separate blocks of days. A real edge shows up in most blocks.
+2. **Cost stress:** the result when each trade costs 0.0, 0.1, 0.2 or 0.3 R (slippage, spread, bad fills).
+3. **Uncertainty:** a 95% range for the average R per trade (bootstrap). If the range includes 0, the result could easily be luck.
+4. **Breakdown** by hour, pattern and side. For finding ideas only: small groups look good or bad by chance. Groups under 8 trades are hidden.
+5. **Extra checks:** the default rules plus one extra check at a time (volume, opening gap).
+
+**Result on the first full year (248 trading days, 24 Nov 2025 to 23 Nov 2026, VWAP on):**
+
+| Market | Trades | Average R per trade (after 0.1 R cost) | 95% range | Profitable blocks |
+|---|---|---|---|---|
+| NIFTY 5m | 184 | -0.12 | -0.30 to +0.07 | 1 of 4 |
+| NIFTY 15m | 79 | -0.02 | -0.24 to +0.22 | 2 of 4 |
+| SENSEX 5m | 195 | -0.06 | -0.24 to +0.12 | 1 of 4 |
+| SENSEX 15m | 84 | +0.07 | -0.15 to +0.29 | 2 of 4 |
+
+**What it means:** on a full year the rules show **no proven edge**. The good-looking results on the earlier 58 days did not hold up, the win rate on 5-minute candles is about 24-26% against the roughly 35% a 1:2 setup needs, and every 95% range includes zero. At a 0.3 R cost per trade even the best markets lose money. Do not trade real money on these rules. Use the year of data to look for what does work (per-hour and per-pattern results, other strategy types) and test each idea with the same checks before it goes live.
+
+---
+
 ## 8. Idea history (success or failed)
 
 The "Trade idea" card clears when the next candle comes. The idea is NOT lost. Every idea is saved automatically in **Idea history** (the section below the chart) with:
@@ -407,27 +469,42 @@ Think of a person who keeps a trading diary and reads it before every trade. The
 
 ---
 
-## 9. Free data sources
+## 9. Data sources
 
 | | Yahoo Finance | Angel One SmartAPI |
 |---|---|---|
 | Cost | Free | Free |
-| Account needed | No | Yes (Angel One account) |
-| Live quality | Delayed (usually about 15 minutes) | Better for live use |
-| Option (CE/PE) prices | Estimated only | Real |
+| Account needed | No | Yes (Angel One account and a SmartAPI app) |
+| Live quality | Delayed (usually about 15 minutes) | Near real time (finished candles only) |
+| History | About 58 days of 5m / 15m, 7 days of 1m | A year or more (via `backfill`, section 3b) |
+| Volume | None for the indexes | Real volume from the index futures |
+| Option (CE/PE) prices | Estimated only | Real (live price) |
 
-Start with Yahoo. The dashboard shows a warning when the data is old. In that case use it for learning only.
+**The default source:** the dashboard and the Telegram alert loop use **Angel One when all four `ANGEL_*` values are in your `.env`**, otherwise Yahoo. You can still switch in the drop-down, or set `ALERT_SOURCE` for the alerts. With Yahoo the dashboard shows a warning when the data is old; use it for learning only.
 
-### Using Angel One (optional, later)
-1. Open an Angel One account and create an app at `smartapi.angelone.in` to get your API key. Enable TOTP and keep the TOTP secret.
-2. `pip install smartapi-python pyotp logzero`
-3. Set 4 environment variables in the same terminal (never write them inside the code, never share them): `ANGEL_API_KEY`, `ANGEL_CLIENT_ID`, `ANGEL_PIN`, `ANGEL_TOTP_SECRET`
-   - Windows (Command Prompt): `set ANGEL_API_KEY=your_value`
-   - Windows (PowerShell): `$env:ANGEL_API_KEY="your_value"`
-   - Mac / Linux: `export ANGEL_API_KEY=your_value`
-4. Run `python dashboard.py` and choose "Angel One (free)" in the drop-down, or `python live_monitor.py --source angel`.
+### Setting up Angel One
 
-The Angel One code is written but not tested on a live account yet.
+1. Open an Angel One account and create an app at `smartapi.angelone.in` ("Add App"). Name: anything. Redirect URL: any normal `https://` address (localhost is refused, and it is never used because this project logs in with client ID, PIN and TOTP). Post back URL: leave empty. Primary static IP: your public IP (find it at `https://api.ipify.org`). The portal lets you change the IPs only once a week, and a home connection's IP can change, so keep it up to date.
+2. Enable TOTP on the SmartAPI page and keep the TOTP **secret text** (the long text, not the 6-digit code).
+3. The libraries are in `requirements.txt` (`pip install -r requirements.txt`).
+4. Put the four values in your private `.env` (never in the code, never in chat, never in `.env.example`):
+
+```
+ANGEL_API_KEY=
+ANGEL_CLIENT_ID=
+ANGEL_PIN=
+ANGEL_TOTP_SECRET=
+```
+
+5. Run `python dashboard.py` (it reads `.env` by itself). `python live_monitor.py --source angel` does not read `.env`, so set the four values in the terminal first (PowerShell: `$env:ANGEL_API_KEY="your_value"`).
+
+### Good to know
+
+- **Read-only use.** This project only reads candles and prices. It has no code to place, change or cancel an order. The login still needs your PIN and TOTP secret, and there is no view-only login at Angel One, so keep `.env` private. If you suspect a leak: change your Angel One PIN, enable TOTP again and delete the app in the SmartAPI portal.
+- **Rate limits.** Angel One refuses requests that come too fast ("exceeding access rate" / "Too many requests"). All Angel One requests therefore go through one queue: one at a time, 2 seconds apart, with up to 3 retries. A first load of one market can take about 5 seconds; after that the answer is cached for 10 seconds. Each market is built once at a time, so several browser tabs and the alert loop never repeat the same calls.
+- **Logs.** When a call fails, the Angel One library prints and logs the request headers, which include your API key. The project switches the library's console log off, and the `logs/` folder is ignored by Git. Do not paste its content anywhere.
+- **Tested** with a real account: login, 5m and 15m candles for both indexes, the year of history, futures candles and option prices (outside market hours). Watch the first live market session: the live alerts on Angel One data have not run during market hours yet.
+- **Key type:** the app was created as a "Trading" API key, and it worked for candles, futures and option prices.
 
 ---
 
@@ -446,7 +523,12 @@ The Angel One code is written but not tested on a live account yet.
 | Backtest says fewer than 30 trades | Use `--interval 5m --days 58`, run both NIFTY and SENSEX, or relax one filter in `DEFAULT_FILTERS` and compare. |
 | VIX filter skipped | India VIX could not be downloaded. The rest still works. |
 | Option price says ESTIMATE with Angel One | Live option price could not be fetched. Read the `[option price] ...` message in the terminal. |
-| Angel One login failed | Check the 4 environment variables in the same terminal and the TOTP secret. |
+| Angel One login failed | Check the four `ANGEL_*` values in `.env` (or in the same terminal for `live_monitor.py`) and that the TOTP value is the long secret text, not the 6-digit code. |
+| "Couldn't parse the JSON response ... exceeding access rate" or "Angel One is busy" | Angel One refused requests that came too fast. The tool pauses and retries by itself and keeps the last good data for up to 5 minutes. If it keeps happening, close extra dashboard tabs and wait a minute. |
+| `ModuleNotFoundError: SmartApi`, `pyotp`, `logzero` or `websocket` | Run `pip install -r requirements.txt` in the project's environment. |
+| Dashboard says "Market open" on a holiday | The `HOLIDAYS` list in `option_pricer.py` has only the dates entered so far. Add the missing exchange holidays from the NSE calendar. |
+| Volume says "not available for this data" | You are on Yahoo, or the futures data could not be fetched. VWAP then uses the plain average price of the day. |
+| `backfill-futures` saves nothing for a market | The nearest futures contract only just started (for example right after an expiry). Run it again after the next trading day. |
 | No Telegram alert arrives | Check that the first lines of `python dashboard.py` say `Telegram alerts: ON`. Make sure `TELEGRAM_ALLOW_DELAYED=0` is not set in `.env` (that blocks alerts on old data, which free Yahoo always is). Alerts are only for the idea on screen right now, while the market is open. Run `python telegram_notify.py --check` and `--test` (section 3c). |
 | `--find-chat` shows no chat | Add the bot to the group, send `/start@yourbotname` there, then run it again. |
 | Telegram says "chat not found" | The chat id is wrong, or the bot is not in the group. Run `--find-chat` again. |
@@ -455,10 +537,11 @@ The Angel One code is written but not tested on a live account yet.
 
 ## 11. Known limits
 
-- Everything was tested offline with fake candles. Live Yahoo and Angel One runs, and the chart in a real browser, still need to be confirmed on your machine.
-- Yahoo gives only about 60 days of 5-minute candles, so the first backtest is a small sample.
-- With Yahoo, option prices are **estimates** (live option prices are saved only with Angel One, and that code is not yet tested on a live account). A real exit can also be worse than the stop price if the market moves very fast.
-- Market holidays are only partly handled (the `HOLIDAYS` list in `option_pricer.py`).
+- The rules and tests were first checked offline with fake candles. Angel One was tested with a real account outside market hours; a full live market session on Angel One data (including alerts) still needs to be watched.
+- Yahoo gives only about 60 days of 5-minute candles. With Angel One you can save a year (section 3b); the one-year result is in section 7c and shows no proven edge.
+- Futures volume history is short: expired contracts cannot be downloaded, so it only grows from when it was first saved. The index candles themselves have no volume, so in the long backtests VWAP is the plain average price for most days.
+- With Yahoo, option prices are **estimates** (live option prices come only from Angel One). A real exit can also be worse than the stop price if the market moves very fast.
+- Market holidays are only partly handled: the `HOLIDAYS` list in `option_pricer.py` (used for expiry dates, and now also to show "Market closed") has only 24 Nov 2026 and 25 Dec 2026. Add the other NSE / BSE holidays yourself.
 - Backtest results are on the INDEX in R, not in rupees.
 - The rules are a starting idea. Only your backtest and history can tell if they work.
 - The memory needs many examples before it is useful, and it can be fooled by luck or by a changed market.
@@ -468,7 +551,8 @@ The Angel One code is written but not tested on a live account yet.
 ## 12. Plan
 
 1. **Round 1 (done):** filters, backtest, journal. Run the backtest, then watch the journal.
-2. **Round 2 (needs Angel One account):** live data, real option prices, option chain (open interest) and futures volume.
+2. **Round 2 (mostly done):** Angel One live data, a year of saved candles, real option prices and futures volume are in. Still to do: option chain (open interest) and a longer futures volume history.
+   - **Round 2b (next):** test other strategy types on the year of data (opening-range breakout, VWAP pullback, trend continuation, mean reversion). A strategy goes live only if it is positive in at least 3 of 4 walk-forward blocks, beats the random baseline, and its 95% range after costs is above zero. Then: one quality score to rank ideas, and risk limits (daily loss limit, position sizing).
 3. **Round 3:** Claude explanation layer (explains the idea in simple words, does not calculate prices), then tune rules using backtest and journal results.
 4. Only after a good backtest AND a good journal: think about small real trades. Auto-orders last.
 
