@@ -104,7 +104,12 @@ def _angel_login():
         return _angel_client
 
     from SmartApi import SmartConnect
+    import logging
+    import logzero
     import pyotp
+
+    # The Angel One library prints request headers (including your API key) when a call fails.
+    logzero.loglevel(logging.CRITICAL)
 
     missing = [k for k in ("ANGEL_API_KEY", "ANGEL_CLIENT_ID", "ANGEL_PIN", "ANGEL_TOTP_SECRET")
                if not os.environ.get(k)]
@@ -121,27 +126,66 @@ def _angel_login():
     return client
 
 
-def fetch_angel(index: str = "nifty", interval: str = "5m", days: int = None) -> pd.DataFrame:
+ANGEL_CALL_GAP_SECONDS = 2.0        # Angel One refuses candle requests that come too fast
+ANGEL_RETRY_WAITS = (5, 10, 20, 40)   # seconds to wait before each retry after "exceeding access rate"
+_angel_last_call = [0.0]
+
+
+def _angel_get_candles(client, params: dict):
+    """getCandleData with a pause between calls and a few retries when Angel One says 'too fast'."""
+    import time
+
+    for attempt in range(len(ANGEL_RETRY_WAITS) + 1):
+        wait = ANGEL_CALL_GAP_SECONDS - (time.time() - _angel_last_call[0])
+        if wait > 0:
+            time.sleep(wait)
+        _angel_last_call[0] = time.time()
+        try:
+            res = client.getCandleData(params)
+            too_fast = (isinstance(res, dict) and not res.get("status")
+                        and ("too many requests" in str(res.get("message", "")).lower()
+                             or res.get("errorcode") == "AB1021"))
+            if not too_fast:
+                return res
+            error = RuntimeError(str(res))
+        except Exception as raised:
+            error = raised
+            too_fast = "access rate" in str(raised).lower()
+        if not too_fast or attempt == len(ANGEL_RETRY_WAITS):
+            raise error
+        time.sleep(ANGEL_RETRY_WAITS[attempt])
+
+
+def fetch_angel_range(index: str, interval: str, start: datetime, end: datetime,
+                      allow_empty: bool = False) -> pd.DataFrame:
+    """Candles between two times (IST). Angel One limits how long one request may be (see candle_store)."""
     client = _angel_login()
-    days = days or {"1m": 5, "5m": 15, "15m": 30}[interval]
     exchange, token = ANGEL_INDEX[index]
-    now = datetime.now(IST)
     params = {
         "exchange": exchange,
         "symboltoken": token,
         "interval": ANGEL_INTERVALS[interval],
-        "fromdate": (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M"),
-        "todate": now.strftime("%Y-%m-%d %H:%M"),
+        "fromdate": start.astimezone(IST).strftime("%Y-%m-%d %H:%M"),
+        "todate": end.astimezone(IST).strftime("%Y-%m-%d %H:%M"),
     }
-    res = client.getCandleData(params)
+    res = _angel_get_candles(client, params)
     rows = (res or {}).get("data")
     if not rows:
+        if allow_empty and (res or {}).get("status"):
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"],
+                                index=pd.DatetimeIndex([], tz=IST, name="datetime"))
         raise RuntimeError(f"Angel One returned no candles: {res}")
 
     df = pd.DataFrame(rows, columns=["datetime", "open", "high", "low", "close", "volume"])
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.set_index("datetime")
     return _to_ist_index(df)
+
+
+def fetch_angel(index: str = "nifty", interval: str = "5m", days: int = None) -> pd.DataFrame:
+    days = days or {"1m": 5, "5m": 15, "15m": 30}[interval]
+    now = datetime.now(IST)
+    return fetch_angel_range(index, interval, now - timedelta(days=days), now)
 
 
 # ---------------------------------------------------------------------------

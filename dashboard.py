@@ -32,6 +32,7 @@ import telegram_notify as tg
 from candle_patterns import PATTERN_INFO
 from data_sources import IST, INTERVAL_MINUTES, drop_forming_candle, fetch_angel_option, get_candles
 from option_pricer import build_option_levels, get_vix_daily
+from candle_analysis import live_analysis, rejected_setups
 from candle_signals import compute_features
 from live_monitor import market_is_open
 from trade_plan import build_trade_plan
@@ -43,6 +44,14 @@ app = Flask(__name__)
 IST_OFFSET_SECONDS = 5 * 3600 + 30 * 60   # chart shows UTC, so we shift times to IST
 MARKER_CANDLES = 200                      # show pattern arrows only on the last 200 candles
 MARKER_TEXT_CANDLES = 40                  # show pattern names only on the last 40 candles
+ANGEL_KEYS = ("ANGEL_API_KEY", "ANGEL_CLIENT_ID", "ANGEL_PIN", "ANGEL_TOTP_SECRET")
+
+
+def default_source() -> str:
+    """Angel One (live data, real option prices) when its four values are in .env, else Yahoo."""
+    return "angel" if all(os.environ.get(k) for k in ANGEL_KEYS) else "yahoo"
+
+
 CACHE_SECONDS = 10                        # do not call the data source more than every 10s
 _cache = {}
 SERVER_TOKEN = str(time.time())           # new value every time the server restarts (page auto-refresh)
@@ -127,6 +136,12 @@ def build_payload(source: str, index: str, interval: str) -> dict:
     delayed = market_open and lag_min > INTERVAL_MINUTES[interval] + 3
     current_price = float(full["close"].iloc[-1])
     plan = build_trade_plan(analysed, index, interval_min, current_price)
+    try:
+        analysis = live_analysis(plan, last_ts, interval_min, market_open, last)
+        analysis["rejected"] = rejected_setups(analysed, index, interval_min)
+    except Exception as error:                          # the explanation must never break the dashboard
+        print(f"[analysis] problem: {error}")
+        analysis = None
 
     # Convert index levels into OPTION price levels (what you actually buy / sell)
     if plan["signal"] != "NONE":
@@ -205,6 +220,7 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         "delayed": delayed,
         "learning_only": (not market_open) or delayed,
         "plan": plan,
+        "analysis": analysis,
         "journal": journal_summary,
         "last_price": current_price,
         "prev_price": float(full["close"].iloc[-2]) if len(full) > 1 else None,
@@ -226,7 +242,7 @@ def build_payload(source: str, index: str, interval: str) -> dict:
 
 @app.route("/api/data")
 def api_data():
-    source = request.args.get("source", "yahoo")
+    source = request.args.get("source", default_source())
     index = request.args.get("index", "nifty")
     interval = request.args.get("interval", "5m")
 
@@ -332,7 +348,7 @@ def _alert_tick(source: str = None, markets: list = None) -> int:
     One look at every watched market. Runs only on weekdays from 9:10 to 16:00 IST (the last
     half hour after the close is for late results). Returns how many markets were checked.
     """
-    source = source or os.environ.get("ALERT_SOURCE", "yahoo").strip().lower()
+    source = source or os.environ.get("ALERT_SOURCE", default_source()).strip().lower()
     now = datetime.now(IST)
     minutes = now.hour * 60 + now.minute
     if now.weekday() >= 5 or not (9 * 60 + 10 <= minutes <= 16 * 60):
@@ -371,7 +387,7 @@ def _alert_banner() -> str:
         return ("Telegram alerts: OFF (add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to a .env file; "
                 "see .env.example)")
     watching = ", ".join(f"{i.upper()} {t}" for i, t in _alert_markets())
-    source = os.environ.get("ALERT_SOURCE", "yahoo").strip().lower()
+    source = os.environ.get("ALERT_SOURCE", default_source()).strip().lower()
     text = f"Telegram alerts: ON (watching {watching}; data: {source})"
     if source == "yahoo" and tg.allow_delayed():
         text += ("\n  Note: free Yahoo data is about 15 minutes late, so each alert says DELAYED DATA. "
@@ -545,6 +561,21 @@ PAGE = r"""<!DOCTYPE html>
   .list .t { color: var(--muted); font-size: 12px; }
   .list .what { flex: 1; min-width: 0; }
   #recent { max-height: 150px; overflow-y: auto; }
+  /* live analysis: the 4 steps and the recently dropped setups */
+  .steps { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 4px 0 8px; }
+  .step { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font-size: 12px; min-width: 0; }
+  .step .st { font-weight: 700; display: flex; justify-content: space-between; align-items: center; gap: 6px; white-space: nowrap; }
+  .step .sd { margin-top: 2px; color: var(--muted); line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2;
+              -webkit-box-orient: vertical; overflow: hidden; }
+  .step.ok { border-color: var(--green); background: var(--green-bg); } .step.ok .st { color: var(--green); }
+  .step.fail { border-color: var(--red); background: var(--red-bg); } .step.fail .st { color: var(--red); }
+  .step.wait { opacity: .6; }
+  #stepNote { font-size: 13px; line-height: 1.4; }
+  #rejected { max-height: 260px; overflow-y: auto; }
+  #rejected .item { display: block; }
+  #rejected .why { font-size: 12px; color: var(--muted); }
+  @media (min-width: 1100px) { #rejected { column-count: 2; column-gap: 18px; max-height: none; }
+                               #rejected .item { break-inside: avoid; } }
 
   /* history */
   .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 12px 0 6px; }
@@ -584,6 +615,7 @@ PAGE = r"""<!DOCTYPE html>
     .mid { grid-column: 2; grid-row: 1; }
     .lowcol { grid-column: 3; grid-row: 1; flex-direction: column; }
     .lowcol > .card { flex: none; }
+    #cardRejected { grid-column: 1; grid-row: 2; }
     #chart { height: clamp(320px, calc(100vh - 240px), 900px); }
   }
   @media (max-width: 1000px) {
@@ -630,8 +662,8 @@ PAGE = r"""<!DOCTYPE html>
       </div>
       <label class="field">Data
         <select id="source" aria-label="Data source">
-          <option value="yahoo">Yahoo (free)</option>
           <option value="angel">Angel One (free)</option>
+          <option value="yahoo">Yahoo (free)</option>
         </select>
       </label>
       <button class="btn" id="refresh" type="button">&#x21BB; Refresh</button>
@@ -693,9 +725,20 @@ PAGE = r"""<!DOCTYPE html>
           <div id="recent" class="list muted">--</div>
         </section>
       </div>
+
+      <section class="card" id="cardRejected">
+        <h3>Recent setups with no idea <span class="hint">(a pattern appeared, but a rule said no)</span></h3>
+        <div id="rejected" class="list muted">--</div>
+      </section>
     </div>
 
     <div class="col mid">
+      <section class="card" id="cardAnalysis">
+        <h3>Live analysis <span class="hint" id="anNext"></span></h3>
+        <div class="steps" id="anSteps"></div>
+        <div id="stepNote" class="muted">--</div>
+        <div id="anFacts" class="muted small" style="margin-top:4px"></div>
+      </section>
       <section class="card" id="cardWhy">
         <h3>Why this decision</h3>
         <div id="why" class="muted">--</div>
@@ -773,7 +816,7 @@ const clear = (node) => { node.textContent = ''; return node; };
 // ---------------- state (remembered between visits) ----------------
 const OK = { index: ['nifty', 'sensex'], interval: ['1m', '5m', '15m'], source: ['yahoo', 'angel'] };
 const state = {
-  index: store.get('cs.index', 'nifty'), interval: store.get('cs.interval', '5m'), source: store.get('cs.source', 'yahoo'),
+  index: store.get('cs.index', 'nifty'), interval: store.get('cs.interval', '5m'), source: store.get('cs.source', 'angel'),
 };
 Object.keys(OK).forEach((k) => { if (OK[k].indexOf(state[k]) < 0) state[k] = OK[k][k === 'interval' ? 1 : 0]; });
 const NAMES = { nifty: 'NIFTY 50', sensex: 'SENSEX' };
@@ -894,6 +937,31 @@ function renderDecision(d) {
   }
   tag.style.display = practice ? '' : 'none';
   tag.textContent = practice;
+}
+
+// ---------------- live analysis (4 steps + dropped setups) ----------------
+function renderAnalysis(d) {
+  const a = d.analysis, stepsBox = clear($('anSteps')), note = $('stepNote'), rej = clear($('rejected'));
+  if (!a) { note.textContent = 'Analysis is not available right now.'; rej.textContent = '--'; $('anNext').textContent = ''; return; }
+  $('anNext').textContent = a.next_candle_closes ? '· next candle closes ' + a.next_candle_closes : '';
+  const icon = { ok: '✔', fail: '✘', wait: '…' };
+  a.steps.forEach((s, n) => {
+    const el = h('div', 'step ' + s.state, null, [
+      h('div', 'st', null, [h('span', null, (n + 1) + '. ' + s.title), h('span', null, icon[s.state])]),
+      h('div', 'sd', s.detail),
+    ]);
+    el.title = s.detail;
+    stepsBox.appendChild(el);
+  });
+  note.textContent = a.headline;
+  $('anFacts').textContent = a.facts && a.facts.length ? a.facts.join('  ·  ') : '';
+  if (!a.rejected.length) { rej.textContent = 'None in the recent candles.'; return; }
+  a.rejected.forEach((r) => {
+    rej.appendChild(h('div', 'item', null, [
+      h('div', null, null, [h('span', 't', r.time + '  '), document.createTextNode(r.setup)]),
+      h('div', 'why', 'Dropped: ' + r.why),
+    ]));
+  });
 }
 
 // ---------------- why (checklist) ----------------
@@ -1055,6 +1123,7 @@ function render(d) {
   $('updated').textContent = 'Updated ' + d.updated + (d.candle_running ? ' \u00B7 candle running' : '');
 
   renderDecision(d);
+  renderAnalysis(d);
   renderWhy(d);
   renderTrade(d);
   renderJournal(d.journal);

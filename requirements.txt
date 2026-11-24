@@ -3,7 +3,8 @@ numpy>=2.5,<3
 yfinance>=1.8
 flask>=3.1,<3.2
 
-# Optional, only for the Angel One source:
-# smartapi-python
-# pyotp
-# logzero
+# Angel One source (longer history, live option prices). Needs the ANGEL_* values in .env
+smartapi-python>=1.5,<2
+pyotp>=2.9,<3
+logzero>=1.7,<2
+websocket-client>=1.6,<2

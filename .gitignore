@@ -26,3 +26,6 @@ sensex_*.csv
 .DS_Store
 Thumbs.db
 .claude/settings.local.json
+
+# Angel One library writes request logs here (they contain your API key)
+logs/
