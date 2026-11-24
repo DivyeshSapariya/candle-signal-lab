@@ -31,12 +31,13 @@ import candle_memory
 import telegram_notify as tg
 from candle_patterns import PATTERN_INFO
 from data_sources import (IST, INTERVAL_MINUTES, angel_futures, angel_option_contracts, angel_too_fast, drop_forming_candle,
-                          fetch_angel_future, fetch_angel_option, fetch_angel_option_oi, get_candles)
-from option_pricer import build_option_levels, get_vix_daily
+                          fetch_angel_future, fetch_angel_option, fetch_angel_option_oi, get_candles, option_lot_size)
+from option_pricer import build_option_levels, get_vix_daily, is_holiday
 from candle_analysis import live_analysis, rejected_setups
 import candle_chain
+import risk_limits
 import candle_store
-from candle_signals import compute_features
+from candle_signals import compute_features, TRADE_START_MIN, TRADE_END_MIN, EXPIRY_CUTOFF_MIN
 from live_monitor import market_is_open
 from trade_plan import build_trade_plan
 
@@ -166,6 +167,33 @@ def build_payload(source: str, index: str, interval: str) -> dict:
                 lines["vwap"].append(vwap_points)
             vwap_points.append({"time": t, "value": round(float(r["vwap"]), 2)})
 
+    # --- zones where the rules say no (first 15 min / after 3 pm, expiry-day afternoon), day open, sub-panel series ---
+    zones = []
+    for ts, r in analysed.iterrows():
+        if bool(r["is_expiry"]) and r["start_min"] >= EXPIRY_CUTOFF_MIN:
+            zones.append({"time": chart_time(ts), "kind": "expiry"})
+        elif r["start_min"] < TRADE_START_MIN or r["start_min"] + interval_min > TRADE_END_MIN:
+            zones.append({"time": chart_time(ts), "kind": "time"})
+
+    def _col(series, digits=2):
+        return [{"time": chart_time(t), "value": round(float(v), digits)} for t, v in series.items() if pd.notna(v)]
+
+    panels = {"adx": _col(analysed["adx"], 1), "vix": _col(analysed["vix_prev"], 2), "volx": _col(analysed["vol_ratio"], 2),
+              "oi_pcr": [], "oi_flow": []}
+    try:                                  # open interest panels use the SAVED option history only (no rule uses them)
+        saved_oi = candle_store.load_option_chain(index)
+        if len(saved_oi):
+            oi = candle_chain.oi_features(saved_oi, analysed.index, interval_min)
+            panels["oi_pcr"] = _col(oi["oi_pcr"], 2)
+            panels["oi_flow"] = _col(oi["oi_flow"] * 100, 2)
+    except Exception as error:
+        print(f"[chart] open interest panels not available: {error}")
+    last_day = analysed["day"].iloc[-1]
+    day_rows = analysed[analysed["day"] == last_day]
+    levels = {k: (None if pd.isna(analysed.iloc[-1][k]) else round(float(analysed.iloc[-1][k]), 2))
+              for k in ("pdh", "pdl", "pdc", "or_high", "or_low", "swing_high", "swing_low", "gap_pct")}
+    levels["day_open"] = round(float(day_rows["open"].iloc[0]), 2)
+
     # --- arrows on the chart + list of recent patterns ---
     markers, recent = [], []
     for ts, row in analysed.iterrows():
@@ -233,6 +261,13 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         print(f"[chain] problem: {error}")
         chain = None
 
+    risk_cfg = risk_limits.settings()
+    try:
+        risk = risk_limits.day_status(journal.today_stats(now.date()), risk_cfg)
+    except Exception as error:
+        print(f"[risk] could not read today's numbers: {error}")
+        risk = None
+
     # Convert index levels into OPTION price levels (what you actually buy / sell)
     if plan["signal"] != "NONE":
         live_price, live_expiry = None, None
@@ -249,6 +284,12 @@ def build_payload(source: str, index: str, interval: str) -> dict:
                 now=now, live_price=live_price, expiry=live_expiry)
         except Exception as error:
             print(f"[option price] could not calculate option levels: {error}")
+        try:                                              # display-only: how many lots fit your risk (off unless set in .env)
+            o = plan.get("option_levels")
+            plan["sizing"] = (risk_limits.position_size(risk_cfg, o.get("loss_per_unit"), option_lot_size(index))
+                              if o else None)
+        except Exception as error:
+            print(f"[risk] position size not available: {error}")
 
     # Automatic history: save every idea of today (even ones that already vanished from the card),
     # then check how earlier ideas ended. Finished ideas also go into the memory.
@@ -293,7 +334,8 @@ def build_payload(source: str, index: str, interval: str) -> dict:
     try:
         journal.scan_today(analysed, index, interval, interval_min, now.date(),
                            now.isoformat(timespec="seconds"), option_levels_for,
-                           should_alert, on_new_idea)
+                           should_alert, on_new_idea,
+                           (lambda stats: risk_limits.check(stats, risk_cfg)) if risk_limits.limits_on(risk_cfg) else None)
         journal.update_results(analysed, index, interval_min, on_finished)
         journal_summary = journal.summary()
     except Exception as error:
@@ -312,14 +354,16 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         "plan": plan,
         "analysis": analysis,
         "chain": chain,
+        "risk": risk,
         "journal": journal_summary,
         "last_price": current_price,
         "prev_price": float(full["close"].iloc[-2]) if len(full) > 1 else None,
         "candle_running": len(full) > len(finished),
         "candles": candles,
         "lines": lines,
-        "levels": {k: (None if pd.isna(last[k]) else round(float(last[k]), 2))
-                   for k in ("pdh", "pdl", "pdc", "or_high", "or_low", "swing_high", "swing_low")},
+        "levels": levels,
+        "zones": zones,
+        "panels": panels,
         "markers": markers,
         "latest": {
             "time": last_ts.strftime("%d %b %H:%M"),
@@ -473,7 +517,7 @@ def _alert_tick(source: str = None, markets: list = None) -> int:
     source = source or os.environ.get("ALERT_SOURCE", default_source()).strip().lower()
     now = datetime.now(IST)
     minutes = now.hour * 60 + now.minute
-    if now.weekday() >= 5 or not (9 * 60 + 10 <= minutes <= 16 * 60):
+    if now.weekday() >= 5 or is_holiday(now.date()) or not (9 * 60 + 10 <= minutes <= 16 * 60):
         return 0
     checked = 0
     for index, interval in (markets or _alert_markets()):
@@ -668,9 +712,14 @@ PAGE = r"""<!DOCTYPE html>
   .chartopts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 8px; }
   .chartopts .chip { min-height: 30px; padding: 0 10px; font-size: 12px; display: inline-flex; align-items: center; }
   .chartopts .gap { flex: 1 1 8px; }
+  .chartopts .brk { flex: 0 0 100%; height: 0; }
   .chartopts .zl { font-size: 11px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; font-weight: 600; margin-right: 2px; }
   .lg { display: inline-block; width: 14px; height: 3px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
   #chart { height: clamp(300px, calc(100vh - 470px), 620px); border-radius: 6px; overflow: hidden; }
+  .subpanel { margin-top: 6px; }
+  .subpanel .subtitle { font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; font-weight: 600; color: var(--muted); padding: 2px 0 2px 4px; }
+  .subchart { height: 96px; border-radius: 6px; overflow: hidden; }
+  .subpanel .nodata { font-size: 12px; color: var(--muted); padding: 6px 4px; }
   .ftiles { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
   .ftile { flex: 1 1 90px; min-width: 0; background: var(--surface2); border-radius: 12px; padding: 8px 10px; display: flex; flex-direction: column; gap: 1px; }
   .ftile .lbl { font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; font-weight: 600; color: var(--muted); }
@@ -791,6 +840,9 @@ PAGE = r"""<!DOCTYPE html>
   .oi-facts { margin: 10px 0 0; padding: 10px 0 0 16px; border-top: 1px solid var(--line); font-size: 12px; line-height: 1.4; color: var(--soft); }
   .oi-facts li { margin: 0 0 2px; }
 
+  #riskLine:empty { display: none; }
+  #riskLine { margin-bottom: 10px; font-size: 12.5px; color: var(--soft); }
+  #riskLine .box { margin-top: 6px; }
   .guide { margin-top: 0; background: var(--surface); border-radius: 12px; }
   footer { margin: 0; padding: 0 0 20px; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
 
@@ -892,6 +944,7 @@ PAGE = r"""<!DOCTYPE html>
         </div>
         <div class="chartopts" id="chartOpts" role="group" aria-label="Chart options"></div>
         <div id="chart"></div>
+        <div id="subPanels"></div>
         <div class="ftiles" id="factTiles"></div>
       </section>
     </div>
@@ -942,6 +995,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="col t2c">
       <section class="card" aria-label="Paper-trade scoreboard">
         <h3>Paper-trade scoreboard <span class="hint">automatic, no real money</span></h3>
+        <div id="riskLine"></div>
         <div id="journal" class="muted">--</div>
       </section>
     </div>
@@ -1037,11 +1091,15 @@ const chartOptions = (c) => ({
   layout: { background: { color: c.bg }, textColor: c.text },
   grid: { vertLines: { color: c.grid }, horzLines: { color: c.grid } },
   timeScale: { timeVisible: true, secondsVisible: false, borderColor: c.border },
-  rightPriceScale: { borderColor: c.border },
+  rightPriceScale: { borderColor: c.border, minimumWidth: 72 },
 });
 const seriesOptions = (c) => ({ upColor: c.up, downColor: c.down, borderVisible: false, wickUpColor: c.up, wickDownColor: c.down });
 
 const chart = LightweightCharts.createChart($('chart'), Object.assign({ autoSize: true, crosshair: { mode: 0 } }, chartOptions(THEMES[theme])));
+// shaded bands behind the candles: where the rules say no (time of day, expiry-day afternoon)
+const zoneSeries = chart.addHistogramSeries({ priceScaleId: 'zones', priceLineVisible: false, lastValueVisible: false,
+  crosshairMarkerVisible: false, autoscaleInfoProvider: () => ({ priceRange: { minValue: 0, maxValue: 1 } }) });
+chart.priceScale('zones').applyOptions({ visible: false, scaleMargins: { top: 0, bottom: 0 } });
 const series = chart.addCandlestickSeries(seriesOptions(THEMES[theme]));
 // indicator lines: VWAP (amber, dashed, one piece per day) and the EMA 9 / EMA 21 the rules use
 const LINE_COLORS = { vwap: '#f3b94d', ema9: '#4da3ff', ema21: '#b48bff' };
@@ -1061,8 +1119,26 @@ const CHART_OPTS = [
   { key: 'walls', label: 'OI walls', color: '#ff7a70', on: false },
   { key: 'arrows', label: 'Pattern arrows', color: '#2bd4b4', on: true },
   { key: 'signal', label: 'Signal candle', color: '#f3b94d', on: true },
-  { key: 'ideas', label: 'Past ideas', color: '#c9d3df', on: true },
+  { key: 'ideas', label: 'Past ideas', color: '#9aa8b6', on: true },
+  { key: 'zones', label: 'No-trade zones', color: '#8794a3', on: true },
+  { key: 'dayopen', label: 'Day open', color: '#8794a3', on: false },
+  { key: 'rr', label: 'Risk / reward zone', color: '#2bd4b4', on: true },
+  { key: 'p_adx', label: 'ADX panel', color: '#b48bff', on: false },
+  { key: 'p_vix', label: 'VIX panel', color: '#f3b94d', on: false },
+  { key: 'p_volx', label: 'Volume panel', color: '#4da3ff', on: false },
+  { key: 'p_oipcr', label: 'OI ratio panel', color: '#7ee8d6', on: false },
+  { key: 'p_oiflow', label: 'OI build-up panel', color: '#ff7a70', on: false },
 ];
+// small panels under the chart, lined up with it (one chart each, zoom follows the main chart)
+const PANELS = [
+  { key: 'p_adx', data: 'adx', title: 'ADX (the rules need 20 or more)', kind: 'line', color: '#b48bff', ref: 20, refTitle: '20' },
+  { key: 'p_vix', data: 'vix', title: 'India VIX, previous close (the rules need 22 or less)', kind: 'line', color: '#f3b94d', ref: 22, refTitle: '22' },
+  { key: 'p_volx', data: 'volx', title: 'Futures volume, times its recent average (optional check: 1 or more)', kind: 'hist', color: '#4da3ff', ref: 1, refTitle: '1x' },
+  { key: 'p_oipcr', data: 'oi_pcr', title: 'Put/call OI ratio (saved OI days only)', kind: 'line', color: '#7ee8d6', ref: 1, refTitle: '1' },
+  { key: 'p_oiflow', data: 'oi_flow', title: 'OI build-up %, puts minus calls over 30 min (saved OI days only)', kind: 'hist2', color: '#ff7a70', ref: 0, refTitle: '0' },
+];
+const subCharts = {};
+let rrSeries = [];
 const opts = {};
 CHART_OPTS.forEach((o) => { opts[o.key] = store.get('cs.opt.' + o.key, o.on ? '1' : '0') === '1'; });
 let lastData = null, levelLines = [];
@@ -1103,12 +1179,19 @@ function applyChartOpts() {
   series.setMarkers(marks.sort((a, b) => a.time - b.time));
   levelLines.forEach((x) => series.removePriceLine(x));
   levelLines = [];
+  drawZones();
+  drawRiskReward();
+  drawPanels();
   if (!lastData) return;
   const lv = lastData.levels || {}, ch = lastData.chain;
   const add = (price, color, title, style) => {
     if (price === null || price === undefined) return;
     levelLines.push(series.createPriceLine({ price: price, color: color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title: title }));
   };
+  if (opts.dayopen && lv.day_open !== undefined && lv.day_open !== null) {
+    const gap = (lv.gap_pct === null || lv.gap_pct === undefined) ? '' : ' (gap ' + (lv.gap_pct >= 0 ? '+' : '') + lv.gap_pct.toFixed(2) + '%)';
+    add(lv.day_open, '#8794a3', 'Open' + gap, 1);
+  }
   if (opts.prev) { add(lv.pdh, '#9aa8b6', 'PD high', 2); add(lv.pdl, '#9aa8b6', 'PD low', 2); add(lv.pdc, '#9aa8b6', 'PD close', 1); }
   if (opts.orange) { add(lv.or_high, '#7ee8d6', 'OR high', 2); add(lv.or_low, '#7ee8d6', 'OR low', 2); }
   if (opts.swing) { add(lv.swing_high, '#6d8bb0', 'Swing high', 1); add(lv.swing_low, '#6d8bb0', 'Swing low', 1); }
@@ -1117,9 +1200,75 @@ function applyChartOpts() {
     if (ch.put_wall) add(ch.put_wall.strike, '#2bd4b4', 'Put wall', 3);
   }
 }
+const ZONE_COLORS = { time: 'rgba(135,148,163,0.16)', expiry: 'rgba(255,122,112,0.16)' };
+function drawZones() {
+  const z = lastData && opts.zones ? lastData.zones || [] : [];
+  zoneSeries.setData(z.map((p) => ({ time: p.time, value: 1, color: ZONE_COLORS[p.kind] || ZONE_COLORS.time })));
+}
+function drawRiskReward() {
+  const p = lastData && lastData.plan;
+  const on = opts.rr && p && p.signal !== 'NONE' && p.decision_time;
+  if (!on) { rrSeries.forEach((x) => chart.removeSeries(x)); rrSeries = []; return; }
+  const from = chartTime(p.decision_time), times = lastData.candles.map((c) => c.time).filter((t) => t >= from);
+  const make = (value, rgba) => {
+    const x = chart.addBaselineSeries({ baseValue: { type: 'price', price: p.entry }, lineWidth: 1,
+      topLineColor: 'rgba(0,0,0,0)', bottomLineColor: 'rgba(0,0,0,0)', topFillColor1: rgba, topFillColor2: rgba,
+      bottomFillColor1: rgba, bottomFillColor2: rgba, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+    x.setData(times.map((t) => ({ time: t, value: value })));
+    return x;
+  };
+  rrSeries.forEach((x) => chart.removeSeries(x));
+  rrSeries = [make(p.target, 'rgba(43,212,180,0.20)'), make(p.stop, 'rgba(255,122,112,0.20)')];
+}
+function panelData(def) {
+  const m = new Map(((lastData.panels || {})[def.data] || []).map((x) => [x.time, x.value]));
+  return lastData.candles.map((c) => {
+    if (!m.has(c.time)) return { time: c.time };
+    const v = m.get(c.time);
+    const out = { time: c.time, value: v };
+    if (def.kind === 'hist') out.color = v >= def.ref ? 'rgba(77,163,255,0.75)' : 'rgba(135,148,163,0.6)';
+    if (def.kind === 'hist2') out.color = v >= 0 ? 'rgba(43,212,180,0.75)' : 'rgba(255,122,112,0.75)';
+    return out;
+  });
+}
+function drawPanels() {
+  const host = $('subPanels');
+  PANELS.forEach((def) => {
+    const entry = subCharts[def.key];
+    if (!opts[def.key] || !lastData) {
+      if (entry) { entry.chart.remove(); entry.box.remove(); delete subCharts[def.key]; }
+      return;
+    }
+    const data = panelData(def), has = data.some((x) => x.value !== undefined);
+    let e = entry;
+    if (!e) {
+      const box = h('div', 'subpanel', null, [h('div', 'subtitle', def.title), h('div', 'subchart')]);
+      host.appendChild(box);
+      const c = LightweightCharts.createChart(box.lastChild, Object.assign({ autoSize: true, handleScroll: false, handleScale: false,
+        crosshair: { mode: 0 } }, chartOptions(THEMES[theme])));
+      c.applyOptions({ timeScale: { visible: false } });
+      const ser = def.kind === 'line'
+        ? c.addLineSeries({ color: def.color, lineWidth: 2, priceLineVisible: false, lastValueVisible: true })
+        : c.addHistogramSeries({ color: def.color, priceLineVisible: false, lastValueVisible: false });
+      ser.createPriceLine({ price: def.ref, color: '#8794a3', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: def.refTitle });
+      e = subCharts[def.key] = { chart: c, series: ser, box: box };
+      const range = chart.timeScale().getVisibleLogicalRange();
+      if (range) c.timeScale().setVisibleLogicalRange(range);
+    }
+    e.series.setData(data);
+    let note = e.box.querySelector('.nodata');
+    if (!has && !note) { note = h('div', 'nodata', 'No data for the days on screen yet.'); e.box.appendChild(note); }
+    if (has && note) note.remove();
+  });
+}
+chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+  if (!range) return;
+  Object.values(subCharts).forEach((e) => e.chart.timeScale().setVisibleLogicalRange(range));
+});
 function buildChartOpts() {
   const box = clear($('chartOpts'));
   CHART_OPTS.forEach((o) => {
+    if (o.key === 'p_adx') { box.appendChild(h('span', 'brk')); box.appendChild(h('span', 'zl', 'Panels')); }
     const b = h('button', 'chip', null, [h('i', 'lg'), document.createTextNode(o.label)]);
     b.type = 'button';
     b.firstChild.style.background = o.color;
@@ -1154,6 +1303,7 @@ function applyTheme(t) {
   store.set('cs.theme', t);
   const c = THEMES[t];
   chart.applyOptions(chartOptions(c)); series.applyOptions(seriesOptions(c));
+  Object.values(subCharts).forEach((e) => { e.chart.applyOptions(chartOptions(c)); e.chart.applyOptions({ timeScale: { visible: false } }); });
   if (detailChart) { detailChart.applyOptions(chartOptions(c)); detailSeries.applyOptions(seriesOptions(c)); }
   $('themeBtn').textContent = t === 'dark' ? '\u2600' : '\u263E';
   $('themeBtn').title = t === 'dark' ? 'Switch to light theme' : 'Switch to dark theme';
@@ -1218,9 +1368,10 @@ function renderDecision(d) {
   const right = clear($('dRight'));
   const tag = $('dTag');
   const strip = $('dStrip');
-  const practice = d.delayed
+  let practice = d.delayed
     ? 'Practice only: data is about ' + d.data_lag_min + ' min old (free Yahoo is delayed). Use Angel One for live data.'
     : (!d.market_open ? 'Practice only: market is closed, this is the last session.' : '');
+  if (d.risk && d.risk.reached) practice = (practice ? practice + ' ' : '') + 'Daily limit reached: new ideas are skipped, no alert.';
 
   if (p.signal === 'NONE') {
     box.className = 'decision none';
@@ -1386,6 +1537,16 @@ function renderTrade(d) {
   kv(box, 'Target at', fmt(p.target), 'up');
   kv(box, 'Risk : reward', p.risk_points.toFixed(1) + ' : ' + p.reward_points.toFixed(1) + ' points');
 
+  if (p.sizing) {
+    const z = p.sizing;
+    box.appendChild(h('div', 'group', 'Position size (your risk settings)'));
+    kv(box, 'Risk budget', rs(z.budget) + ' (' + z.risk_pct + '% of ' + rs(z.capital) + ')');
+    kv(box, 'Lot size', String(z.lot_size));
+    kv(box, 'Loss per lot at the stop', rs(z.loss_per_lot), 'down');
+    kv(box, 'Lots that fit', String(z.lots), z.lots ? 'up' : 'down');
+    box.appendChild(h('div', 'muted small', z.note + '. This is a helper only, no order is placed.'));
+  }
+
   if (p.memory) {
     const icon = p.memory.verdict === 'warns' ? '\u26A0 ' : p.memory.verdict === 'agrees' ? '\u2714 ' : '\u2139 ';
     box.appendChild(h('div', 'box ' + p.memory.verdict, icon + 'Memory: ' + p.memory.text));
@@ -1411,6 +1572,21 @@ function renderTrade(d) {
   addLine(p.entry, '#4da3ff', 'ENTRY');
   addLine(p.stop, '#ff7a70', 'STOP LOSS');
   addLine(p.target, '#2bd4b4', 'TARGET');
+}
+
+// ---------------- daily risk limits (only shown when set in .env) ----------------
+function renderRisk(d) {
+  const box = clear($('riskLine')), r = d.risk;
+  if (!r || !r.enabled) return;
+  const parts = [];
+  if (r.max_loss_r) parts.push('max loss ' + r.max_loss_r + 'R');
+  if (r.max_ideas) parts.push('max ' + r.max_ideas + ' ideas');
+  box.appendChild(h('div', null, null, [
+    document.createTextNode('Today: ' + r.ideas + ' idea(s), '),
+    h('b', r.net_r >= 0 ? 'up' : 'down', (r.net_r >= 0 ? '+' : '') + r.net_r.toFixed(2) + 'R'),
+    document.createTextNode('  \u00B7 limits: ' + parts.join(', ')),
+  ]));
+  if (r.reached) box.appendChild(h('div', 'box warn', r.reached + '. New ideas are saved as skipped and no alert is sent.'));
 }
 
 // ---------------- scoreboard ----------------
@@ -1513,6 +1689,7 @@ function render(d) {
   renderDecision(d);
   renderAnalysis(d);
   renderChain(d);
+  renderRisk(d);
   renderWhy(d);
   renderTrade(d);
   renderJournal(d.journal);

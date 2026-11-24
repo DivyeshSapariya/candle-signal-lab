@@ -19,10 +19,11 @@ Where does volatility come from?
 Limits you must know:
   - Time decay between now and when the index touches entry is not included.
   - A real exit can be worse than the stop price if the market moves fast (slippage).
-  - Update HOLIDAYS below each year (exchange holidays shift weekly expiry dates).
+  - Keep holidays.csv up to date each year (exchange holidays shift weekly expiry dates).
 """
 
 import math
+import os
 import time as _time
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -38,10 +39,55 @@ EXPIRY_WEEKDAY = {"nifty": 1, "sensex": 3}
 
 # Exchange holidays on weekdays. If expiry falls on one, it moves to the previous trading day.
 # Keep this list updated from the NSE / BSE holiday calendar.
-HOLIDAYS = {
+# They are read from holidays.csv (see read_holidays); the two dates below are used only if that file is missing.
+_BUILTIN_HOLIDAYS = {
     date(2026, 11, 24),   # Guru Nanak Jayanti
     date(2026, 12, 25),   # Christmas
 }
+HOLIDAYS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "holidays.csv")
+HOLIDAYS = set(_BUILTIN_HOLIDAYS)
+_holiday_stamp = [None]
+
+
+def read_holidays(path: str):
+    """
+    Read holidays.csv ("date,name" per line, # = comment). Returns (set of dates, list of problems).
+    A bad line is reported and skipped, it never stops the tool.
+    """
+    found, problems = set(), []
+    with open(path, encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
+            text = line.strip()
+            if not text or text.startswith("#") or text.lower().startswith("date"):
+                continue
+            try:
+                found.add(date.fromisoformat(text.split(",", 1)[0].strip()))
+            except ValueError:
+                problems.append(f"line {number}: '{text[:40]}' is not YYYY-MM-DD,name")
+    return found, problems
+
+
+def is_holiday(d: date) -> bool:
+    """True if d is an exchange holiday. holidays.csv is re-read whenever the file changes."""
+    path = os.environ.get("HOLIDAYS_FILE") or HOLIDAYS_FILE
+    try:
+        stamp = (path, os.path.getmtime(path))
+    except OSError:
+        stamp = (path, None)
+    if stamp != _holiday_stamp[0]:
+        _holiday_stamp[0] = stamp
+        found, problems = set(_BUILTIN_HOLIDAYS), []
+        if stamp[1] is not None:
+            try:
+                found, problems = read_holidays(path)
+            except OSError as error:
+                problems = [f"cannot read {path}: {error}"]
+                found = set(_BUILTIN_HOLIDAYS)
+        for problem in problems:
+            print(f"[holidays] {problem}")
+        HOLIDAYS.clear()
+        HOLIDAYS.update(found)
+    return d in HOLIDAYS
 
 _vix_cache = {"time": 0.0, "value": None}
 
@@ -84,7 +130,7 @@ def implied_vol(price: float, spot: float, strike: float, years: float, side: st
 # Expiry date
 # ---------------------------------------------------------------------------
 def _previous_trading_day(d: date) -> date:
-    while d.weekday() >= 5 or d in HOLIDAYS:
+    while d.weekday() >= 5 or is_holiday(d):
         d -= timedelta(days=1)
     return d
 

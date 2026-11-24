@@ -38,7 +38,11 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `test_candle_backfill.py` | Checks the Angel One downloader and the rate-limit handling with a fake Angel One (no login, no internet). |
 | `telegram_notify.py` | Sends a short Telegram message when a new idea appears and when it ends (see section 3c). Also has the setup helpers `--check`, `--test` and `--find-chat`. |
 | `test_telegram_notify.py` | Tests the Telegram alerts with a fake Telegram, so no real bot is needed. |
-| `.env.example` | Template for your private settings (Telegram, Angel One). Copy it to `.env` and fill in your values (sections 3c and 9). |
+| `holidays.csv` | The exchange holidays (date, name). The tool reads market status, expiry dates and the alert loop from it. Add rows from the NSE / BSE calendar; saving the file is enough (section 3d). |
+| `risk_limits.py` | Optional daily limits and the position-size helper, all off until you set values in `.env` (section 3d). |
+| `session_check.py` | A read-only end-of-day check: trading day, fresh data, the day's ideas and alerts, what was saved, your settings (section 3d). |
+| `test_holidays.py`, `test_risk_limits.py`, `test_session_check.py` | Tests for the three items above. |
+| `.env.example` | Template for your private settings (Telegram, Angel One, optional risk limits). Copy it to `.env` and fill in your values (sections 3c and 9). |
 | `requirements.txt` | The packages the project needs (`pip install -r requirements.txt`). |
 | `README.md` | This document. |
 
@@ -87,7 +91,8 @@ Tip: you do not have to activate the environment. You can also run any command w
 | Check that the rules never use the future | `python test_no_lookahead.py` |
 | Telegram: check the settings / send a test message / find the group id | `python telegram_notify.py --check` / `--test` / `--find-chat` |
 | Test the Telegram alerts (no real bot needed) | `python test_telegram_notify.py` |
-| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_candle_chain.py`, `python test_oi_filters.py`, `python test_strategy_lab.py` |
+| End-of-day check (read-only) | `python session_check.py` (options `--date YYYY-MM-DD`, `--no-live`) |
+| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_candle_chain.py`, `python test_oi_filters.py`, `python test_strategy_lab.py`, `python test_holidays.py`, `python test_risk_limits.py`, `python test_session_check.py` |
 
 Stop any of them with **Ctrl + C**.
 
@@ -122,9 +127,24 @@ In the page: use the buttons at the top to pick NIFTY / SENSEX and 1 / 5 / 15 mi
 | OI walls | The call wall and put wall as price lines (same strikes as the option chain card) | Off |
 | Pattern arrows | The CE / PE arrows and pattern names | On |
 | Signal candle | When an idea is active, a square on the signal candle ("signal") and a circle on the confirmation candle ("confirm") | On |
+| No-trade zones | Shaded bands behind the candles where the rules say no: grey for the first 15 minutes and after 3 pm, red for the afternoon of an expiry day (from 1 pm) | On |
+| Day open | A line at today's opening price, labelled with the opening gap (for example "Open (gap +0.50%)") | Off |
+| Risk / reward zone | When an idea is active, a green band from entry to target and a red band from entry to stop, starting at the decision candle | On |
 | Past ideas | Every journal idea for the market and candle size on screen, on its signal candle, labelled with the side and result (for example "CE +1.90R"), green for success, red for failed, amber for time exit, grey for waiting | On |
 
-Past ideas older than the visible range appear when you zoom out (press "All"). None of these options changes a rule or an alert.
+Past ideas older than the visible range appear when you zoom out (press "All").
+
+**Panels** (a second row of buttons, all off by default). Each switches on a small chart under the main chart. It is lined up with the main chart and follows its zoom. They show what the rules look at, so you can see why a check passed or failed:
+
+| Panel | Shows | Reference line |
+|---|---|---|
+| ADX panel | Trend strength | 20 (the rules need 20 or more) |
+| VIX panel | India VIX of the previous close | 22 (the rules need 22 or less) |
+| Volume panel | Futures volume divided by its recent 20-candle average, so only days with futures volume have bars | 1x (the optional volume check) |
+| OI ratio panel | Put/call open-interest ratio | 1 |
+| OI build-up panel | Put minus call OI build-up over 30 minutes, in % (green = more puts written) | 0 |
+
+The two OI panels use the **saved** option history only (section 3b), so they show past days that were saved, not the live minute. A panel says "No data for the days on screen yet" when nothing is saved for them. None of the chart options changes a rule or an alert.
 
 The page is made of flexible rows, so it follows the size of your window: the chart and the checklist share a row on a wide screen, and everything stacks into one column on a phone.
 
@@ -287,6 +307,26 @@ Put them in `.env` or set them in the terminal (a value set in the terminal wins
 
 ---
 
+## 3d. Holidays, risk limits and the end-of-day check
+
+**Holidays (`holidays.csv`).** One holiday per line as `date,name` (for example `2027-01-26,Republic Day`); lines starting with `#` are ignored. The tool uses it for "Market closed", for the weekly expiry date (an expiry on a holiday moves to the previous trading day) and to keep the Telegram alert loop quiet. **Saving the file is enough**: it is re-read when it changes, no restart needed. A bad line is reported in the console and skipped, and if the file is missing the two built-in dates (24 Nov and 25 Dec 2026) are used. **Only those two dates are in it so far; add the other NSE / BSE holidays from the official calendar.**
+
+**Risk limits (optional, off while empty).** Put values in your private `.env` (see `.env.example`):
+
+| Setting | What it does |
+|---|---|
+| `RISK_MAX_LOSS_R=3` | After the day's finished ideas lose this many R (net, after cost), **new** ideas are saved as SKIPPED and no alert is sent |
+| `RISK_MAX_IDEAS_PER_DAY=4` | After this many ideas in a day (both markets together), new ideas are skipped the same way |
+| `RISK_CAPITAL=200000` and `RISK_PER_TRADE_PCT=1` | Turn on the **position-size helper**: in Trade details it shows your risk budget, the lot size (from Angel One's public instrument list), the loss per lot at the stop and how many lots fit. It only shows numbers |
+
+- A skipped idea says "Daily limit ..." in its note, never counts as an idea made, is never traded and does not block the next idea. Ideas saved earlier are not changed.
+- The scoreboard card shows "Today: N idea(s), X R, limits ..." and a warning when a limit is reached; the banner tag says "Daily limit reached".
+- The limits are about discipline, not prediction. They change no rule and place no order.
+
+**End-of-day check (`python session_check.py`).** Read-only: it writes nothing. After the close it prints OK / CHECK / INFO lines for: whether it was a trading day; whether NIFTY and SENSEX live candles are fresh (it asks the data source, skip with `--no-live`); the day's ideas, net result, alerts recorded and ideas skipped by a limit; what your database saved that day (candles, futures volume, option open interest) and the last collection runs, with failed runs flagged; and whether alerts, Angel One values, limits and the helper are set. Use `--date` to look at an earlier day. It cannot see the dashboard's console messages, so it reports only what was recorded.
+
+---
+
 ## 4. The candle patterns
 
 | Pattern | Simple meaning | Leans towards |
@@ -372,7 +412,7 @@ The index levels are the trigger. You buy an **option**, so the dashboard also s
 
 - **With Angel One (live):** it takes the real option price and works backwards from it. Most accurate.
 - **With Yahoo (free):** it uses India VIX to estimate. The real price in Groww can differ by 10 to 20% or more. Check the real price before buying. If it is very different, do not trade.
-- Weekly expiry: NIFTY on Tuesday, SENSEX on Thursday. If that day is a holiday, expiry moves to the previous trading day. Keep the `HOLIDAYS` list in `option_pricer.py` updated.
+- Weekly expiry: NIFTY on Tuesday, SENSEX on Thursday. If that day is a holiday, expiry moves to the previous trading day. Keep `holidays.csv` updated (section 3d).
 - On expiry day the card shows a warning.
 
 **How to use it in Groww:** check the real option price, buy, then place a stop-loss order at the STOP LOSS option price and a sell order at the TARGET option price. Then you do not need to watch the screen all the time. If you miss the entry candle, skip the idea.
@@ -594,7 +634,7 @@ ANGEL_TOTP_SECRET=
 | Angel One login failed | Check the four `ANGEL_*` values in `.env` (or in the same terminal for `live_monitor.py`) and that the TOTP value is the long secret text, not the 6-digit code. |
 | "Couldn't parse the JSON response ... exceeding access rate" or "Angel One is busy" | Angel One refused requests that came too fast. The tool pauses and retries by itself and keeps the last good data for up to 5 minutes. If it keeps happening, close extra dashboard tabs and wait a minute. |
 | `ModuleNotFoundError: SmartApi`, `pyotp`, `logzero` or `websocket` | Run `pip install -r requirements.txt` in the project's environment. |
-| Dashboard says "Market open" on a holiday | The `HOLIDAYS` list in `option_pricer.py` has only the dates entered so far. Add the missing exchange holidays from the NSE calendar. |
+| Dashboard says "Market open" on a holiday | `holidays.csv` has only the dates entered so far. Add the missing exchange holidays from the NSE calendar (section 3d). |
 | Volume says "not available for this data" | You are on Yahoo, or the futures data could not be fetched. VWAP then uses the plain average price of the day. |
 | `backfill-futures` saves nothing for a market | The nearest futures contract only just started (for example right after an expiry). Run it again after the next trading day. |
 | No Telegram alert arrives | Check that the first lines of `python dashboard.py` say `Telegram alerts: ON`. Make sure `TELEGRAM_ALLOW_DELAYED=0` is not set in `.env` (that blocks alerts on old data, which free Yahoo always is). Alerts are only for the idea on screen right now, while the market is open. Run `python telegram_notify.py --check` and `--test` (section 3c). |
@@ -610,7 +650,7 @@ ANGEL_TOTP_SECRET=
 - Option-chain (OI) history is short too: it starts on 19 Nov 2026 and only grows daily; it covers only the nearest expiry and the strikes around the index level of each day.
 - Futures volume history is short: expired contracts cannot be downloaded, so it only grows from when it was first saved. The index candles themselves have no volume, so in the long backtests VWAP is the plain average price for most days.
 - With Yahoo, option prices are **estimates** (live option prices come only from Angel One). A real exit can also be worse than the stop price if the market moves very fast.
-- Market holidays are only partly handled: the `HOLIDAYS` list in `option_pricer.py` (used for expiry dates, and now also to show "Market closed") has only 24 Nov 2026 and 25 Dec 2026. Add the other NSE / BSE holidays yourself.
+- Market holidays are only as complete as `holidays.csv`, which has only 24 Nov 2026 and 25 Dec 2026 so far. Add the other NSE / BSE holidays yourself (section 3d).
 - Backtest results are on the INDEX in R, not in rupees.
 - The rules are a starting idea. Only your backtest and history can tell if they work.
 - The memory needs many examples before it is useful, and it can be fooled by luck or by a changed market.
@@ -621,7 +661,7 @@ ANGEL_TOTP_SECRET=
 
 1. **Round 1 (done):** filters, backtest, journal. Run the backtest, then watch the journal.
 2. **Round 2 (mostly done):** Angel One live data, a year of saved candles, real option prices and futures volume are in. Option-chain OI is saved daily (section 3b) and shown in the dashboard as facts, but not used in any rule. The `oi_*` checks and their research section are built but off; still to do: judge them once 60 trading days of OI exist (about late February 2027), and build a longer futures volume history.
-   - **Round 2b (tested, none passed):** other strategy types were tested on the year of data (section 7d: 0 of 16 passed). A strategy goes live only if it is positive in at least 3 of 4 walk-forward blocks, beats the random baseline, and its 95% range after costs is above zero. Then: one quality score to rank ideas, and risk limits (daily loss limit, position sizing).
+   - **Round 2b (tested, none passed):** other strategy types were tested on the year of data (section 7d: 0 of 16 passed). A strategy goes live only if it is positive in at least 3 of 4 walk-forward blocks, beats the random baseline, and its 95% range after costs is above zero. Risk limits and the position-size helper are built (section 3d, off until you set values). Still to do: one quality score to rank ideas.
 3. **Round 3:** Claude explanation layer (explains the idea in simple words, does not calculate prices), then tune rules using backtest and journal results.
 4. Only after a good backtest AND a good journal: think about small real trades. Auto-orders last.
 

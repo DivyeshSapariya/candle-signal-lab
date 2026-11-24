@@ -141,13 +141,14 @@ def make_story(status: str, bars: int, peak_r: float, dd_r: float, r_gross, inte
 # Save a new idea
 # ---------------------------------------------------------------------------
 def record_idea(plan: dict, index: str, interval: str, created: str, memory: dict = None,
-                option_levels: dict = None, alerts: str = "") -> bool:
+                option_levels: dict = None, alerts: str = "", skip_reason: str = "") -> bool:
     """
     Save a new idea once. Returns True if it was new.
     option_levels: the option prices (buy / stop loss / target) at the moment the idea was made.
     It is saved with the idea, because the real option price cannot be found out later.
     alerts: notes which alerts belong to this idea ("new" = a Telegram alert was sent for it, and
     "result" is added when the alert about its result has been sent). It keeps every alert to ONE.
+    skip_reason: when given (a daily risk limit), the idea is saved as SKIPPED with this note and is never traded.
     """
     key = f"{index}|{interval}|{plan['signal_time']}|{plan['signal']}"
     with _lock:
@@ -161,12 +162,14 @@ def record_idea(plan: dict, index: str, interval: str, created: str, memory: dic
             "decision_time": plan["decision_time"], "mode": plan["mode"],
             "entry": plan["entry"], "stop": plan["stop"], "target": plan["target"],
             "risk": plan["risk_points"], "option": plan["option"],
-            "status": "PENDING", "fill": "", "exit_time": "", "exit_price": "", "r": "", "note": "",
+            "status": "SKIPPED" if skip_reason else "PENDING", "fill": "", "exit_time": "", "exit_price": "", "r": "",
+            "note": skip_reason,
             "pattern": ctx.get("pattern", ""), "score": plan.get("score", ""),
             "reasons": json.dumps(plan.get("reasons", [])), "context": json.dumps(ctx),
             "memory": json.dumps(memory) if memory else "",
             "bars": "", "peak_r": "", "dd_r": "",
-            "story": make_story("PENDING", 0, 0, 0, None, 5),
+            "story": (make_story("SKIPPED", 0, 0, 0, None, 5, skip_reason) if skip_reason
+                      else make_story("PENDING", 0, 0, 0, None, 5)),
             "option_levels": json.dumps(option_levels) if option_levels else "",
             "alerts": alerts,
         }
@@ -271,8 +274,36 @@ def update_results(f: pd.DataFrame, index: str, interval_min: int, on_finished=N
             print(f"[journal] result alert failed: {error}")
 
 
+def today_stats(day) -> dict:
+    """How today is going, over all markets: ideas made (not counting skipped ones) and net R of finished ones."""
+    with _lock:
+        df = _load()
+    ideas, net = 0, 0.0
+    for _, row in df.iterrows():
+        try:
+            if pd.Timestamp(row["signal_time"]).date() != day:
+                continue
+        except (ValueError, TypeError):
+            continue
+        if row["status"] != "SKIPPED":
+            ideas += 1
+        r = _num(row["r"])
+        if row["status"] in FINISHED and r is not None:
+            net += r - COST_R
+    return {"ideas": ideas, "net_r": round(net, 4)}
+
+
+def _status_of(key: str):
+    """(status, note) of a saved idea, or None when it is new."""
+    with _lock:
+        df = _load()
+    hit = df[df["key"] == key]
+    return None if hit.empty else (str(hit.iloc[0]["status"]), str(hit.iloc[0]["note"]))
+
+
 def scan_today(f: pd.DataFrame, index: str, interval: str, interval_min: int,
-               today, created: str, option_levels_for=None, should_alert=None, on_new_idea=None) -> int:
+               today, created: str, option_levels_for=None, should_alert=None, on_new_idea=None,
+               limit_check=None) -> int:
     """
     Save every idea of TODAY's session that is not saved yet (for example ideas that appeared
     and vanished while you were not looking). Same one-trade-at-a-time rule as the backtest.
@@ -280,6 +311,8 @@ def scan_today(f: pd.DataFrame, index: str, interval: str, interval_min: int,
     should_alert: optional function(plan) -> True if a NEW idea deserves an alert (Telegram).
     on_new_idea: optional function(plan, option_levels, memory), called once for such an idea,
     only when it was really new (never again after a restart).
+    limit_check: optional function(today_stats) -> reason or None. A NEW idea with a reason is saved as
+    SKIPPED (daily risk limit) and gets no alert and no trade.
     """
     days = f["day"].values
     todays = [i for i in range(len(f)) if days[i] == today]
@@ -292,6 +325,16 @@ def scan_today(f: pd.DataFrame, index: str, interval: str, interval_min: int,
         plan = evaluate(f, i, index, interval_min)
         if plan["signal"] == "NONE":
             continue
+        key = f"{index}|{interval}|{plan['signal_time']}|{plan['signal']}"
+        known = _status_of(key)
+        if known is not None and known[0] == "SKIPPED" and known[1].startswith("Daily limit"):
+            continue                                  # skipped because of a risk limit: it was never traded
+        skip_reason = ""
+        if known is None and limit_check is not None:
+            try:
+                skip_reason = limit_check(today_stats(today)) or ""
+            except Exception as error:                # a limit problem must never stop the journal
+                print(f"[journal] could not check the daily limit: {error}")
         try:
             memory = candle_memory.recall(plan, index, interval_min)
         except Exception:
@@ -303,13 +346,15 @@ def scan_today(f: pd.DataFrame, index: str, interval: str, interval_min: int,
             except Exception as error:               # the journal must work without option prices
                 print(f"[journal] could not get option prices: {error}")
         want_alert = False
-        if should_alert is not None and on_new_idea is not None:
+        if should_alert is not None and on_new_idea is not None and not skip_reason:
             try:
                 want_alert = bool(should_alert(plan))
             except Exception as error:
                 print(f"[journal] could not decide about the alert: {error}")
-        if record_idea(plan, index, interval, created, memory, levels, "new" if want_alert else ""):
+        if record_idea(plan, index, interval, created, memory, levels, "new" if want_alert else "", skip_reason):
             added += 1
+            if skip_reason:
+                continue                              # saved as skipped: not traded, does not block the next idea
             if want_alert:
                 try:
                     on_new_idea(plan, levels, memory)

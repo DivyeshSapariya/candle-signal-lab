@@ -335,6 +335,18 @@ def angel_option_contracts(index: str, spot: float, strikes: int = 5, now: datet
     return sorted((r for r in rows if r["strike"] in keep), key=lambda r: (r["strike"], r["side"]))
 
 
+def option_lot_size(index: str):
+    """Lot size of the index options from Angel One's public instrument list (no login). None if unknown."""
+    segment, name = OPTION_SEGMENT[index]
+    try:
+        for row in _load_scrip_master():
+            if row.get("name") == name and row.get("exch_seg") == segment and row.get("instrumenttype") == "OPTIDX":
+                return int(float(row["lotsize"]))
+    except Exception as error:
+        print(f"[lot size] not available: {error}")
+    return None
+
+
 def fetch_angel_option_oi(contracts: list) -> tuple:
     """
     Current open interest of option contracts (one read-only request for all of them).
