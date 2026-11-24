@@ -33,7 +33,8 @@ def main():
     at = lambda h, m: datetime(2026, 11, 25, h, m, tzinfo=IST)
     assert flags(sc.freshness_lines("nifty", at(11, 0), at(11, 7), day)) == ["OK"]      # 2 min behind
     assert flags(sc.freshness_lines("nifty", at(10, 0), at(11, 7), day)) == ["CHECK"]   # 62 min behind
-    assert flags(sc.freshness_lines("nifty", at(15, 25), at(16, 5), day)) == ["OK"]     # complete session
+    assert flags(sc.freshness_lines("nifty", at(15, 10), at(16, 5), day)) == ["OK"]     # the feed's last real candle
+    assert flags(sc.freshness_lines("nifty", at(15, 25), at(16, 5), day)) == ["OK"]     # a longer feed is fine too
     assert flags(sc.freshness_lines("nifty", at(14, 0), at(16, 5), day)) == ["CHECK"]   # stopped early
     assert flags(sc.freshness_lines("nifty", datetime(2026, 11, 23, 15, 25, tzinfo=IST), at(11, 0), day)) == ["CHECK"]
     assert flags(sc.freshness_lines("nifty", None, at(11, 0), day)) == ["CHECK"]

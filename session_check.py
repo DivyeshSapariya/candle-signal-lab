@@ -45,13 +45,15 @@ def freshness_lines(index: str, newest, now: datetime, day: date, interval_min: 
     newest = newest.astimezone(IST)
     if newest.date() != day:
         return [(CHECK, f"{index.upper()}: newest candle is from {newest:%d %b %H:%M}, not {day:%d %b}.")]
-    last_expected = datetime.combine(day, datetime.min.time(), IST).replace(hour=15, minute=30) - timedelta(minutes=interval_min)
+    # Angel One's index feed has no real candles after 15:10 (the 15:15 and 15:20 candles are missing and the 15:25 one
+    # is a single-price closing print that the dashboard drops), so the last REAL 5-minute candle starts at 15:10.
+    last_expected = datetime.combine(day, datetime.min.time(), IST).replace(hour=15, minute=30) - timedelta(minutes=20)
     if now.date() == day and now < last_expected:
         lag = (now - newest).total_seconds() / 60 - interval_min
         flag = OK if lag <= 3 else CHECK
         return [(flag, f"{index.upper()}: newest finished candle {newest:%H:%M}, about {max(lag, 0):.0f} min behind.")]
     flag = OK if newest >= last_expected else CHECK
-    return [(flag, f"{index.upper()}: newest candle {newest:%H:%M} (the last one of the session is {last_expected:%H:%M}).")]
+    return [(flag, f"{index.upper()}: newest candle {newest:%H:%M} (the feed's last real candle is {last_expected:%H:%M}).")]
 
 
 def journal_lines(df: pd.DataFrame, day: date) -> list:
@@ -84,7 +86,7 @@ def db_lines(con, day: date) -> list:
     lines = []
     for idx in ("nifty", "sensex"):
         n = con.execute(f"SELECT COUNT(*) FROM candles WHERE idx=? AND interval='5m' AND {where}", (idx, day.isoformat())).fetchone()[0]
-        lines.append((OK if n >= 70 else CHECK, f"{idx.upper()} 5m candles saved for the day: {n} (a full session has 75)."))
+        lines.append((OK if n >= 70 else CHECK, f"{idx.upper()} 5m candles saved for the day: {n} (a full session has 75; the live feed alone gives 73)."))
     for idx in ("nifty_fut", "sensex_fut"):
         n = con.execute(f"SELECT COUNT(*) FROM candles WHERE idx=? AND interval='5m' AND {where}", (idx, day.isoformat())).fetchone()[0]
         lines.append((OK if n else INFO, f"{idx.upper()} (futures volume) 5m candles saved: {n}."))

@@ -358,7 +358,7 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         "journal": journal_summary,
         "last_price": current_price,
         "prev_price": float(full["close"].iloc[-2]) if len(full) > 1 else None,
-        "candle_running": len(full) > len(finished),
+        "candle_running": market_open and len(full) > len(finished),     # after the close the dropped candle is just the closing print
         "candles": candles,
         "lines": lines,
         "levels": levels,
