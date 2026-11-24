@@ -21,18 +21,29 @@ Use stored history in your own code:
 
 Note: 1-minute candles only reach back 7 days on Yahoo, so run this at least once a week
 (daily is better) or you will lose minutes that cannot be downloaded later.
+
+Longer history from Angel One (needs the ANGEL_* values in .env, read-only, no orders):
+    python candle_store.py backfill --days 365                 # NIFTY + SENSEX, 5m and 15m
+    python candle_store.py backfill --days 365 --index nifty --interval 5m
+It downloads in small pieces with pauses (Angel One refuses fast requests), saves each piece
+straight away, and can be run again safely (it re-downloads the period and updates candles, never duplicates).
 """
 
 import argparse
 import sqlite3
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from data_sources import IST, INTERVAL_MINUTES, drop_forming_candle, fetch_yahoo
+from data_sources import IST, INTERVAL_MINUTES, drop_forming_candle, fetch_angel_range, fetch_yahoo
 
 DB_FILE = "market_data.db"
 INDEXES = ("nifty", "sensex")
+# Longest time one Angel One candle request may cover (their limits are larger; this keeps a margin)
+ANGEL_CHUNK_DAYS = {"1m": 25, "5m": 60, "15m": 100}
+BACKFILL_INTERVALS = ("5m", "15m")      # 1m is only downloaded when you ask for it with --interval 1m
+EMPTY_CHUNKS_TO_STOP = 3                # this many empty pieces in a row = Angel One has no older data
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS candles (
     idx      TEXT    NOT NULL,      -- nifty / sensex
@@ -61,8 +72,13 @@ def _epoch(index: pd.DatetimeIndex) -> list:
     return [int(ts.timestamp()) for ts in index]
 
 
-def save_candles(con: sqlite3.Connection, index: str, interval: str, df: pd.DataFrame) -> int:
-    """Insert or update finished candles. Returns the number of rows written."""
+def save_candles(con: sqlite3.Connection, index: str, interval: str, df: pd.DataFrame,
+                 replace: bool = True) -> int:
+    """
+    Save finished candles. Returns the number of rows given.
+    replace=True updates a candle that is already saved. replace=False keeps the saved one
+    (Yahoo uses this, so it never overwrites the Angel One history).
+    """
     if df.empty:
         return 0
     rows = list(zip(
@@ -71,7 +87,7 @@ def save_candles(con: sqlite3.Connection, index: str, interval: str, df: pd.Data
         df["close"].astype(float), df["volume"].fillna(0).astype(float),
     ))
     with con:
-        con.executemany("INSERT OR REPLACE INTO candles VALUES (?,?,?,?,?,?,?,?)", rows)
+        con.executemany(f"INSERT OR {'REPLACE' if replace else 'IGNORE'} INTO candles VALUES (?,?,?,?,?,?,?,?)", rows)
     return len(rows)
 
 
@@ -83,7 +99,7 @@ def collect_one(con, index: str, interval: str) -> str:
         df = drop_forming_candle(fetch_yahoo(index, interval, period=period), interval)
         before = con.execute("SELECT COUNT(*) FROM candles WHERE idx=? AND interval=?",
                              (index, interval)).fetchone()[0]
-        save_candles(con, index, interval, df)
+        save_candles(con, index, interval, df, replace=False)
         after = con.execute("SELECT COUNT(*) FROM candles WHERE idx=? AND interval=?",
                             (index, interval)).fetchone()[0]
         first, last = (df.index[0].isoformat(), df.index[-1].isoformat()) if len(df) else ("", "")
@@ -99,6 +115,49 @@ def collect_one(con, index: str, interval: str) -> str:
                      0, "", "", f"error: {error}"[:300]))
         con.commit()
     return note
+
+
+def backfill_one(con, index: str, interval: str, days: int, fetch=None, pause=None,
+                 now: datetime = None, log=print) -> str:
+    """
+    Download the last `days` days from Angel One, newest piece first, saving each piece at once.
+    Stops early after a few empty pieces in a row (no older data exists). Safe to run again.
+    """
+    fetch = fetch or fetch_angel_range
+    now = now or datetime.now(IST)
+    step = timedelta(days=ANGEL_CHUNK_DAYS[interval])
+    oldest = now - timedelta(days=days)
+    before = con.execute("SELECT COUNT(*) FROM candles WHERE idx=? AND interval=?", (index, interval)).fetchone()[0]
+
+    end, pieces, empty_run, fetched, note = now, 0, 0, 0, "ok"
+    while end > oldest:
+        start = max(oldest, end - step)
+        try:
+            df = fetch(index, interval, start, end, allow_empty=True)
+        except Exception as error:                         # keep what is saved, say what stopped it
+            note = f"stopped at {start:%d %b %Y}: {error}"[:300]
+            break
+        pieces += 1
+        if len(df):
+            df = drop_forming_candle(df, interval)
+            fetched += save_candles(con, index, interval, df, replace=True)
+            empty_run = 0
+        else:
+            empty_run += 1
+        log(f"    {index.upper()} {interval} {start:%d %b %Y} -> {end:%d %b %Y}: {len(df)} candles")
+        if empty_run >= EMPTY_CHUNKS_TO_STOP:
+            note = "no older data available"
+            break
+        end = start
+        if pause:
+            pause()
+
+    after = con.execute("SELECT COUNT(*) FROM candles WHERE idx=? AND interval=?", (index, interval)).fetchone()[0]
+    con.execute("INSERT INTO collect_log VALUES (?,?,?,?,?,?,?)",
+                (datetime.now(IST).isoformat(timespec="seconds"), index, interval, fetched,
+                 oldest.isoformat(timespec="seconds"), now.isoformat(timespec="seconds"), f"backfill {note}"[:300]))
+    con.commit()
+    return f"{pieces} requests, fetched {fetched}, new {after - before}, total {after} ({note})"
 
 
 def collect_vix(con) -> str:
@@ -163,7 +222,8 @@ def status(con) -> None:
 
 def main():
     p = argparse.ArgumentParser(description="Collect candles into a local SQLite database.")
-    p.add_argument("action", choices=["collect", "status", "export"])
+    p.add_argument("action", choices=["collect", "backfill", "status", "export"])
+    p.add_argument("--days", type=int, default=365, help="backfill: how many days back (default 365)")
     p.add_argument("--index", choices=list(INDEXES), help="only this index (default: both)")
     p.add_argument("--interval", choices=list(INTERVAL_MINUTES), help="only this candle size (default: all)")
     p.add_argument("--no-vix", action="store_true", help="do not collect India VIX")
@@ -180,6 +240,15 @@ def main():
         df = load_candles(args.index, args.interval, args.db)
         df.to_csv(args.out)
         print(f"Wrote {len(df)} candles to {args.out}")
+    elif args.action == "backfill":
+        import telegram_notify
+        telegram_notify.load_env_file()          # reads the ANGEL_* values from the private .env
+        for idx in ([args.index] if args.index else INDEXES):
+            for interval in ([args.interval] if args.interval else BACKFILL_INTERVALS):
+                print(f"{idx.upper()} {interval}: downloading up to {args.days} days from Angel One...")
+                print(f"  -> {backfill_one(con, idx, interval, args.days)}")
+        print()
+        status(con)
     else:
         for idx in ([args.index] if args.index else INDEXES):
             for interval in ([args.interval] if args.interval else INTERVAL_MINUTES):

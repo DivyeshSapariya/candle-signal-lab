@@ -44,6 +44,9 @@ NEAR_LEVEL_ATR = 0.5      # "near a level" = within 0.5 x ATR
 SWING_LOOKBACK = 20
 OPENING_RANGE_MIN = 30
 ADX_PERIOD = 14
+VOLUME_AVG_CANDLES = 20
+VOLUME_MIN_RATIO = 1.0     # signal candle volume vs the recent average
+GAP_BIG_PCT = 0.3          # an opening gap bigger than this (in %) counts as a "big gap"
 ADX_MIN = 20
 MIN_SCORE = 3
 VIX_MAX = 22.0
@@ -65,6 +68,11 @@ DEFAULT_FILTERS = {
     "vix": True,
     "expiry_afternoon": True,
     "lunch": False,
+    # extra checks. VWAP is ON (without volume data it is the day's average price).
+    # Volume and gap are OFF until the research report shows they help (python candle_research.py)
+    "vwap": True,
+    "volume": False,
+    "gap": False,
 }
 
 FILTER_LABELS = {
@@ -76,6 +84,9 @@ FILTER_LABELS = {
     "vix": "India VIX limit",
     "expiry_afternoon": "No expiry-day afternoon trades",
     "lunch": "Skip lunch time",
+    "vwap": "Price on the right side of VWAP",
+    "volume": "Volume above its recent average",
+    "gap": "Not trading against a big opening gap",
 }
 
 
@@ -191,6 +202,32 @@ def add_vix(f: pd.DataFrame, vix_daily) -> pd.DataFrame:
     return f
 
 
+def add_vwap_volume_gap(f: pd.DataFrame) -> pd.DataFrame:
+    """
+    vwap       : today's volume-weighted average price up to and including each candle.
+                 Yahoo gives NO volume for the indexes, so then every candle weighs the same
+                 (a plain average of today's prices, "vwap_proxy" = True).
+    vol_ratio  : candle volume / average of the last 20 candles (NaN when there is no volume).
+    gap_pct    : today's opening price vs yesterday's close, in %. Known from the first candle.
+    Only past and current candles are used, so there is no look-ahead.
+    """
+    f = f.copy()
+    day = pd.Series(f.index.normalize(), index=f.index)
+    typical = (f["high"] + f["low"] + f["close"]) / 3
+    vol = f["volume"].fillna(0).astype(float)
+    has_volume = bool(vol.sum() > 0)
+    weight = vol if has_volume else pd.Series(1.0, index=f.index)
+    num = (typical * weight).groupby(day).cumsum()
+    den = weight.groupby(day).cumsum().replace(0, np.nan)
+    f["vwap"] = num / den
+    f["vwap_proxy"] = not has_volume
+    f["vol_ratio"] = (vol / vol.shift(1).rolling(VOLUME_AVG_CANDLES).mean().replace(0, np.nan)
+                      if has_volume else np.nan)
+    day_open = f["open"].groupby(day).transform("first")
+    f["gap_pct"] = (day_open - f["pdc"]) / f["pdc"] * 100
+    return f
+
+
 def compute_features(df: pd.DataFrame, index: str, interval_min: int, vix_daily=None) -> pd.DataFrame:
     """Everything the engine needs for every candle. Input: finished candles only."""
     f = add_patterns(df)
@@ -199,6 +236,7 @@ def compute_features(df: pd.DataFrame, index: str, interval_min: int, vix_daily=
     f["htf15"] = higher_timeframe_trend(df, 15, interval_min)
     f["htf60"] = higher_timeframe_trend(df, 60, interval_min)
     f = add_levels(f)
+    f = add_vwap_volume_gap(f)
     f = add_vix(f, vix_daily)
 
     f["day"] = f.index.date
@@ -283,7 +321,7 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
     side = next(iter(leans))
     sign = 1 if side == "CE" else -1
     names = " + ".join(pretty(p) for p in found)
-    reasons = [{"text": f"{names} leans {side}", "ok": True, "required": True}]
+    reasons = [{"key": "pattern", "text": f"{names} leans {side}", "ok": True, "required": True}]
 
     # --- confirmation candle ---
     if flt["confirm"]:
@@ -295,7 +333,7 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
             ok = bool(C["close"] < S["low"] and C["red"])
             text = ("Next candle closed below the signal candle low - confirmed" if ok
                     else "Next candle did not close below the signal candle low")
-        reasons.append({"text": text, "ok": ok, "required": True})
+        reasons.append({"key": "confirm", "text": text, "ok": ok, "required": True})
 
     # --- bigger timeframe trend ---
     if flt["htf_trend"]:
@@ -303,6 +341,7 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
         word = lambda v: "UP" if v > 0 else "DOWN" if v < 0 else "unknown"
         ok = bool(h15 == sign and h60 == sign)
         reasons.append({
+            "key": "htf_trend",
             "text": f"15 min trend {word(h15)}, 60 min trend {word(h60)} - "
                     + ("agrees" if ok else "does not agree"),
             "ok": ok, "required": True})
@@ -313,6 +352,7 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
         ok = bool(pd.notna(adx) and adx >= ADX_MIN)
         shown = "n/a" if pd.isna(adx) else f"{adx:.0f}"
         reasons.append({
+            "key": "adx",
             "text": f"Trend strength (ADX) {shown} - " + ("strong enough" if ok else "weak, market is sideways"),
             "ok": ok, "required": True})
 
@@ -320,16 +360,18 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
     if flt["time"]:
         ok = bool(S["start_min"] >= TRADE_START_MIN and C["start_min"] + interval_min <= TRADE_END_MIN)
         reasons.append({
+            "key": "time",
             "text": "Time of day is fine" if ok else "Time of day is bad (first 15 min or after 3 pm)",
             "ok": ok, "required": True})
     if flt["expiry_afternoon"] and bool(S["is_expiry"]):
         ok = bool(S["start_min"] < EXPIRY_CUTOFF_MIN)
         reasons.append({
+            "key": "expiry_afternoon",
             "text": "Expiry day, before 1 pm" if ok else "Expiry day afternoon - too wild, skip",
             "ok": ok, "required": True})
     if flt["lunch"]:
         ok = not (LUNCH_START_MIN <= S["start_min"] < LUNCH_END_MIN)
-        reasons.append({"text": "Not lunch time" if ok else "Lunch time - market is slow",
+        reasons.append({"key": "lunch", "text": "Not lunch time" if ok else "Lunch time - market is slow",
                         "ok": ok, "required": True})
 
     # --- India VIX ---
@@ -338,12 +380,39 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
         if pd.notna(vix):
             ok = bool(vix <= VIX_MAX)
             reasons.append({
+                "key": "vix",
                 "text": f"India VIX {vix:.1f} - " + ("normal" if ok else f"above {VIX_MAX:.0f}, too wild"),
                 "ok": ok, "required": True})
+
+    # --- optional extra checks (all off by default) ---
+    if flt["vwap"] and pd.notna(C["vwap"]):
+        above = bool(C["close"] > C["vwap"])
+        ok = above if side == "CE" else not above
+        label = "average price of the day" if C["vwap_proxy"] else "VWAP"
+        reasons.append({
+            "key": "vwap",
+            "text": f"Price is {'above' if above else 'below'} the {label} ({C['vwap']:,.0f}) - "
+                    + ("agrees" if ok else "does not agree"),
+            "ok": ok, "required": True})
+    if flt["volume"] and pd.notna(C["vol_ratio"]):
+        ok = bool(C["vol_ratio"] >= VOLUME_MIN_RATIO)
+        reasons.append({
+            "key": "volume",
+            "text": f"Volume is {C['vol_ratio']:.1f}x its recent average - "
+                    + ("busy enough" if ok else "quiet, weak move"),
+            "ok": ok, "required": True})
+    if flt["gap"] and pd.notna(C["gap_pct"]):
+        against = (side == "CE" and C["gap_pct"] <= -GAP_BIG_PCT) or                   (side == "PE" and C["gap_pct"] >= GAP_BIG_PCT)
+        reasons.append({
+            "key": "gap",
+            "text": f"Opening gap {C['gap_pct']:+.2f}% - "
+                    + (f"this trade goes against a big gap" if against else "no big gap against this trade"),
+            "ok": not against, "required": True})
 
     # --- points: short-term trend and key level ---
     ema_ok = bool(C["ema9"] > C["ema21"]) if side == "CE" else bool(C["ema9"] < C["ema21"])
     reasons.append({
+        "key": "ema",
         "text": ("Short-term trend (EMA 9 vs EMA 21) agrees" if ema_ok
                  else "Short-term trend (EMA 9 vs EMA 21) does not agree"),
         "ok": ema_ok, "required": False})
@@ -351,7 +420,7 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
     level_ok, level_text = True, ""
     if flt["levels"]:
         level_ok, level_text = _level_check(S, atr, side)
-        reasons.append({"text": f"Signal candle {level_text}", "ok": level_ok, "required": False})
+        reasons.append({"key": "levels", "text": f"Signal candle {level_text}", "ok": level_ok, "required": False})
 
     score = 2 + int(ema_ok) + int(level_ok)
 
@@ -393,6 +462,8 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
         "is_expiry": bool(S["is_expiry"]),
         "ema_ok": bool(ema_ok),
         "atr": round(float(atr), 2),
+        "gap_pct": None if pd.isna(C["gap_pct"]) else round(float(C["gap_pct"]), 2),
+        "above_vwap": None if pd.isna(C["vwap"]) else bool(C["close"] > C["vwap"]),
     }
 
     return {
