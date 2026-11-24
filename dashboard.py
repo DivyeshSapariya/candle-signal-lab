@@ -151,6 +151,21 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         for ts, r in full.iterrows()
     ]
 
+    # --- indicator lines on the chart: VWAP (one piece per day, it restarts every morning) and the two EMAs ---
+    lines = {"ema9": [], "ema21": [], "vwap": []}
+    vwap_day, vwap_points = None, None
+    for ts, r in analysed.iterrows():
+        t = chart_time(ts)
+        if pd.notna(r["ema9"]):
+            lines["ema9"].append({"time": t, "value": round(float(r["ema9"]), 2)})
+        if pd.notna(r["ema21"]):
+            lines["ema21"].append({"time": t, "value": round(float(r["ema21"]), 2)})
+        if pd.notna(r["vwap"]):
+            if ts.date() != vwap_day:
+                vwap_day, vwap_points = ts.date(), []
+                lines["vwap"].append(vwap_points)
+            vwap_points.append({"time": t, "value": round(float(r["vwap"]), 2)})
+
     # --- arrows on the chart + list of recent patterns ---
     markers, recent = [], []
     for ts, row in analysed.iterrows():
@@ -165,9 +180,9 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         })
         if ts >= analysed.index[-MARKER_CANDLES:][0]:
             if leans == "CE":
-                position, shape, color = "belowBar", "arrowUp", "#26a69a"
+                position, shape, color = "belowBar", "arrowUp", "#2bd4b4"
             elif leans == "PE":
-                position, shape, color = "aboveBar", "arrowDown", "#ef5350"
+                position, shape, color = "aboveBar", "arrowDown", "#ff7a70"
             else:
                 position, shape, color = "aboveBar", "circle", "#9aa0a6"
             show_text = ts >= analysed.index[-MARKER_TEXT_CANDLES:][0]
@@ -302,6 +317,7 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         "prev_price": float(full["close"].iloc[-2]) if len(full) > 1 else None,
         "candle_running": len(full) > len(finished),
         "candles": candles,
+        "lines": lines,
         "markers": markers,
         "latest": {
             "time": last_ts.strftime("%d %b %H:%M"),
@@ -509,133 +525,183 @@ PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Candle Signal Dashboard - NIFTY / SENSEX</title>
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root, :root[data-theme="dark"] {
-    --bg: #0b0f17; --surface: #131925; --surface2: #1a2130; --line: #252d3d;
-    --text: #e8ebf2; --muted: #8f99ab; --blue: #4da3ff;
-    --green: #2fbfa5; --red: #ef5350; --amber: #f5a524;
-    --green-bg: rgba(47,191,165,.13); --red-bg: rgba(239,83,80,.13); --amber-bg: rgba(245,165,36,.13);
-    --blue-bg: rgba(77,163,255,.13); --shadow: 0 1px 2px rgba(0,0,0,.35);
+    --bg: #0b0f14; --surface: #131920; --surface2: #1a222c; --line: #263140; --sel: #243241;
+    --text: #e8eef4; --muted: #8794a3; --soft: #9aa8b6; --blue: #4da3ff; --focus: #7ee8d6;
+    --green: #2bd4b4; --red: #ff7a70; --amber: #f3b94d;
+    --green-bg: #0f2b29; --red-bg: #341a1d; --amber-bg: #33280f;
+    --green-bd: #1d5a52; --red-bd: #6b2d33; --amber-bd: #5c4716;
+    --blue-bg: rgba(77,163,255,.13); --shadow: none;
+    color-scheme: dark;
+    --sans: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
   }
   :root[data-theme="light"] {
-    --bg: #f3f5f9; --surface: #ffffff; --surface2: #f0f3f8; --line: #dde2ec;
-    --text: #18202e; --muted: #5d6879; --blue: #1a6fd1;
+    --bg: #f3f5f9; --surface: #ffffff; --surface2: #f0f3f8; --line: #dde2ec; --sel: #e0e7f2;
+    --text: #18202e; --muted: #5d6879; --soft: #4a5568; --blue: #1a6fd1; --focus: #0d8f7d;
     --green: #0d8f7d; --red: #d03a37; --amber: #a86400;
-    --green-bg: rgba(13,143,125,.10); --red-bg: rgba(208,58,55,.09); --amber-bg: rgba(168,100,0,.10);
+    --green-bg: #e3f4f0; --red-bg: #fbe9e8; --amber-bg: #fbf0dc;
+    --green-bd: #8fcfc4; --red-bd: #efb3b1; --amber-bd: #e3c48a;
     --blue-bg: rgba(26,111,209,.09); --shadow: 0 1px 2px rgba(20,30,50,.08);
+    color-scheme: light;
   }
   * { box-sizing: border-box; }
   html { -webkit-text-size-adjust: 100%; }
-  body { margin: 0; background: var(--bg); color: var(--text); line-height: 1.35;
-         font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 13.5px; }
+  body { margin: 0; background: var(--bg); color: var(--text); line-height: 1.35; font-family: var(--sans); font-size: 14px; }
   button, select { font: inherit; color: inherit; }
   button { cursor: pointer; }
-  :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+  button:hover { filter: brightness(1.15); }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
   .up { color: var(--green); } .down { color: var(--red); } .muted { color: var(--muted); }
   .lvl-buy { color: var(--blue); }
   .small { font-size: 12px; }
-  .wrap { max-width: 1800px; margin: 0 auto; padding: 0 12px; }
+  .wrap { max-width: 1480px; margin: 0 auto; padding: 0 16px; }
 
-  /* ---------- top bar (title, status and controls in ONE row) ---------- */
-  .topbar { background: var(--surface); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 20; }
-  .topbar .wrap { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; padding-top: 6px; padding-bottom: 6px; }
-  .brand h1 { margin: 0; font-size: 15px; font-weight: 700; white-space: nowrap; }
-  .status { display: flex; flex-wrap: nowrap; gap: 6px; align-items: center; flex: 1 1 auto; min-width: 0; white-space: nowrap; }
-  .controls { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin-left: auto; }
-  .seg { display: inline-flex; background: var(--surface2); border: 1px solid var(--line); border-radius: 8px; padding: 2px; gap: 2px; }
-  .seg button { background: transparent; border: 0; border-radius: 6px; padding: 4px 10px; font-size: 13px; color: var(--muted); font-weight: 600; }
-  .seg button:hover { color: var(--text); }
-  .seg button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: var(--shadow); outline: 1px solid var(--line); }
-  .field { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
-  select { background: var(--surface2); border: 1px solid var(--line); border-radius: 7px; padding: 4px 8px; font-size: 13px; }
-  .btn { background: var(--surface2); border: 1px solid var(--line); border-radius: 7px; padding: 4px 10px; font-size: 13px; font-weight: 600; }
-  .btn:hover { border-color: var(--blue); }
-  .btn.icon { padding: 4px 8px; }
-  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px;
-          font-size: 12px; font-weight: 600; background: var(--surface2); border: 1px solid var(--line); white-space: nowrap; }
+  /* ---------- top bar ---------- */
+  .topbar { background: var(--bg); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 20; }
+  .topbar .wrap { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding-top: 8px; padding-bottom: 8px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo { width: 28px; height: 28px; border-radius: 8px; background: var(--surface2); border: 1px solid var(--line);
+          display: flex; align-items: center; justify-content: center; }
+  .brand h1 { margin: 0; display: flex; flex-direction: column; line-height: 1.15; font-size: 15px; font-weight: 700; letter-spacing: -.01em; white-space: nowrap; }
+  .brand h1 small { font-size: 11px; font-weight: 400; color: var(--muted); letter-spacing: 0; }
+  .status { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; flex: 1 1 auto; min-width: 0; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; margin-left: auto; }
+  .seg { display: inline-flex; background: var(--surface2); border: 1px solid var(--line); border-radius: 9px; padding: 2px; gap: 2px; }
+  .seg button { background: transparent; border: 0; border-radius: 7px; padding: 5px 11px; min-height: 32px; font-size: 12.5px; color: var(--soft); font-weight: 600; }
+  .seg button[aria-pressed="true"] { background: var(--sel); color: var(--text); }
+  .field { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
+  select { background: var(--surface2); border: 1px solid var(--line); border-radius: 10px; padding: 0 10px; min-height: 36px; font-size: 13px; }
+  .btn { background: var(--surface2); border: 1px solid var(--line); border-radius: 10px; padding: 0 12px; min-height: 36px;
+         font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; gap: 8px; }
+  .btn.icon { padding: 0; width: 36px; justify-content: center; }
+  .pill { display: inline-flex; align-items: center; gap: 8px; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 500;
+          background: var(--surface2); border: 1px solid var(--line); white-space: nowrap; }
   .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
   .pill.open .dot { background: var(--green); box-shadow: 0 0 0 3px var(--green-bg); }
-  .pill.warn { background: var(--amber-bg); border-color: var(--amber); color: var(--amber); }
+  .pill.warn { background: var(--amber-bg); border-color: var(--amber-bd); color: var(--amber); }
   .pill.warn .dot { background: var(--amber); }
   .pill.ok { color: var(--green); }
   .pill.ok .dot { background: var(--green); }
+  #updated { color: var(--soft); }
 
-  #error { display: none; margin: 8px 0 0; background: var(--red-bg); border: 1px solid var(--red);
-           border-radius: 8px; padding: 6px 12px; align-items: center; gap: 12px; }
+  #error { display: none; margin: 12px 0 0; background: var(--red-bg); border: 1px solid var(--red-bd);
+           border-radius: 10px; padding: 8px 12px; align-items: center; gap: 12px; }
   #error.show { display: flex; }
   #error span { flex: 1; }
   #error button { background: transparent; border: 0; font-size: 18px; color: var(--muted); }
 
-  /* ---------- decision banner (slim) ---------- */
-  .decision { margin-top: 8px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface);
-              padding: 8px 14px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr);
-              gap: 14px; align-items: center; box-shadow: var(--shadow); border-left-width: 5px; }
-  .decision.none { border-left-color: var(--muted); }
-  .decision.ce { border-left-color: var(--green); background: linear-gradient(90deg, var(--green-bg), var(--surface) 60%); }
-  .decision.pe { border-left-color: var(--red); background: linear-gradient(90deg, var(--red-bg), var(--surface) 60%); }
+  main.page { padding: 12px 0 0; display: flex; flex-direction: column; gap: 12px; }
+
+  /* ---------- decision banner: answer on the left, the 4 steps on the right ---------- */
+  .decision { border-radius: 12px; border: 1px solid var(--line); background: var(--surface); overflow: hidden; }
+  .dmain { display: flex; flex-wrap: wrap; gap: 14px 20px; padding: 14px 16px; align-items: center; }
+  .dleft { flex: 1 1 380px; min-width: 0; display: flex; gap: 14px; align-items: flex-start; }
+  .dicon { flex: none; width: 42px; height: 42px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+           background: var(--amber-bg); color: var(--amber); border: 1px solid var(--amber-bd); }
+  .decision.ce .dicon { background: var(--green-bg); color: var(--green); border-color: var(--green-bd); }
+  .decision.pe .dicon { background: var(--red-bg); color: var(--red); border-color: var(--red-bd); }
+  .dtext { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
   .kickrow { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
-  .decision .kicker { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
-  .decision h2 { margin: 0; font-size: 21px; line-height: 1.15; }
+  .decision .kicker { font-size: 10.5px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .decision h2 { margin: 0; font-size: 26px; line-height: 1.1; font-weight: 700; letter-spacing: -.025em; }
   .decision.ce h2 { color: var(--green); } .decision.pe h2 { color: var(--red); }
-  .decision .sub { color: var(--muted); font-size: 13px; max-width: 70ch; }
-  .tag { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 11px; font-weight: 700;
-         background: var(--amber-bg); border: 1px solid var(--amber); color: var(--amber); }
-  .tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
-  .tile { background: var(--surface2); border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px; }
-  .tile .lbl { font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
-  .tile .val { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.2; }
+  .decision .sub { color: var(--soft); font-size: 13px; line-height: 1.4; max-width: 70ch; }
+  .tag { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: .03em;
+         background: var(--amber-bg); color: var(--amber); }
+  .dright { flex: 2 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+  .dstrip { border-top: 1px solid var(--line); background: var(--surface2); padding: 7px 16px; font-size: 12px; line-height: 1.4; color: var(--soft); }
+  .dstrip:empty { display: none; }
+  .tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+  .tile { background: var(--surface2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; }
+  .tile .lbl { font-size: 10.5px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .tile .val { font-size: 18px; font-weight: 700; font-family: var(--mono); letter-spacing: -.02em; line-height: 1.2; }
   .tile .note { font-size: 11px; color: var(--muted); }
   .tile.buy .val { color: var(--blue); } .tile.stop .val { color: var(--red); } .tile.target .val { color: var(--green); }
-  .tiles-wrap .what { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .tiles-wrap .what { font-size: 12px; color: var(--soft); margin-bottom: 6px; }
   .tiles-wrap .what b { color: var(--text); }
-  .empty-hint { color: var(--muted); font-size: 12.5px; border: 1px dashed var(--line); border-radius: 8px; padding: 6px 10px; }
+  .stepcap { font-size: 12px; color: var(--muted); }
+  .stepcap:empty { display: none; }
 
-  /* ---------- layout ---------- */
-  .grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 10px; margin-top: 10px; align-items: start; }
-  .left, .col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-  /* under the chart: latest candle and recent patterns sit side by side */
-  .lowcol { flex-direction: row; align-items: stretch; }
-  .lowcol > .card:first-child { flex: 1.5 1 0; min-width: 0; }
-  .lowcol > .card:last-child { flex: 1 1 0; min-width: 0; }
-  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; box-shadow: var(--shadow); }
-  .card h3 { margin: 0 0 5px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 700; }
-  .card h3 .hint { text-transform: none; letter-spacing: 0; font-weight: 500; }
-  .row { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; border-top: 1px solid var(--line); }
+  /* the four steps */
+  .steps { display: flex; flex-wrap: wrap; gap: 10px; }
+  .step { flex: 1 1 170px; min-width: 0; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-size: 12px;
+          background: var(--surface2); display: flex; flex-direction: column; gap: 5px; }
+  .step .st { font-weight: 600; display: flex; justify-content: space-between; align-items: center; gap: 8px; color: var(--soft); }
+  .step .sr { display: inline-flex; align-items: center; gap: 4px; font-weight: 700; }
+  .step .sd { font-size: 12.5px; line-height: 1.35; color: var(--text); display: -webkit-box; -webkit-line-clamp: 3;
+              -webkit-box-orient: vertical; overflow: hidden; }
+  .step.ok { border-color: var(--green-bd); background: var(--green-bg); } .step.ok .sr { color: var(--green); }
+  .step.fail { border-color: var(--red-bd); background: var(--red-bg); } .step.fail .sr { color: var(--red); }
+  .step.wait { opacity: .6; } .step.wait .sr { color: var(--muted); }
+
+  /* ---------- layout: three tiers ---------- */
+  .tier { display: flex; flex-wrap: wrap; gap: 12px; align-items: stretch; }
+  .tier.top { align-items: flex-start; }
+  .col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .t1main { flex: 999 1 600px; min-width: 0; display: flex; flex-direction: column; }
+  .t1side { flex: 1 1 340px; }
+  .t2a { flex: 1 1 300px; } .t2b { flex: 1 1 380px; } .t2c { flex: 1 1 300px; }
+  .t3a { flex: 1 1 480px; } .t3b { flex: 1 1 480px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px; box-shadow: var(--shadow); min-width: 0; }
+  .card h3 { margin: 0 0 8px; font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .card h3 .hint { text-transform: none; letter-spacing: 0; font-weight: 400; font-size: 12px; margin-left: 6px; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-top: 1px solid var(--line); }
   .row:first-of-type { border-top: 0; }
   .row .k { color: var(--muted); } .row .v { font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
 
-  /* chart card: title, price and legend share ONE line */
-  .chart-head { display: flex; flex-wrap: wrap; gap: 2px 14px; align-items: center; margin-bottom: 4px; }
-  .ch-left { display: flex; align-items: baseline; gap: 8px; }
-  .price { font-size: 22px; font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
-  .change { font-size: 12.5px; font-weight: 600; }
-  .legend { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 11.5px; color: var(--muted); flex: 1; }
+  /* chart card */
+  .chartcard { flex: 1; display: flex; flex-direction: column; }
+  .chart-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 12px 20px; margin-bottom: 6px; }
+  .ch-left { display: flex; flex-direction: column; }
+  #chartTitle { font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; font-weight: 600; color: var(--muted); }
+  .pricebox { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; }
+  .price { font-size: 26px; font-weight: 700; font-family: var(--mono); letter-spacing: -.03em; line-height: 1.15; }
+  .change { font-size: 14px; font-weight: 600; font-family: var(--mono); }
+  .legend { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; font-size: 12.5px; color: var(--soft); }
   .legend b { font-size: 12px; }
-  #chart { height: clamp(260px, calc(100vh - 505px), 560px); border-radius: 6px; overflow: hidden; }
+  .lg { display: inline-block; width: 14px; height: 3px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+  #chart { height: clamp(300px, calc(100vh - 470px), 620px); border-radius: 6px; overflow: hidden; }
+  .ftiles { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+  .ftile { flex: 1 1 90px; min-width: 0; background: var(--surface2); border-radius: 12px; padding: 8px 10px; display: flex; flex-direction: column; gap: 1px; }
+  .ftile .lbl { font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; font-weight: 600; color: var(--muted); }
+  .ftile .val { font-size: 17px; font-weight: 700; font-family: var(--mono); letter-spacing: -.02em; }
+  .ftile .val.amber { color: var(--amber); }
+  .ftile .note { font-size: 11px; color: var(--muted); }
+  .ftiles:empty { display: none; }
 
   /* latest candle */
-  .ohlc { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
-  .ohlc div { background: var(--surface2); border-radius: 6px; padding: 3px 8px; }
+  .lcwrap { display: flex; gap: 16px; align-items: stretch; }
+  #lcSvg { flex: none; background: var(--surface2); border-radius: 10px; }
+  .ohlc { flex: 1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .ohlc > div { background: var(--surface2); border-radius: 8px; padding: 6px 10px; }
   .ohlc .lbl { font-size: 11px; color: var(--muted); }
-  .ohlc .val { font-weight: 700; font-size: 13px; font-variant-numeric: tabular-nums; }
-  .pat { margin-top: 6px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface2); }
-  .pat + .pat { margin-top: 5px; }
-  .pat .name { font-weight: 700; margin-right: 8px; }
+  .ohlc .val { font-weight: 600; font-size: 14px; font-family: var(--mono); }
+  .lctiles { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .lctiles > div { flex: 1 1 120px; background: var(--surface2); border-radius: 10px; padding: 10px 12px; }
+  .lctiles .lbl { font-size: 12px; color: var(--muted); }
+  .lctiles .val { font-size: 15px; font-weight: 700; }
+  .pat { margin-top: 8px; padding: 10px 12px; border: 1px dashed var(--line); border-radius: 10px; font-size: 13.5px; color: var(--soft); }
+  .pat + .pat { margin-top: 6px; }
+  .pat .name { font-weight: 700; margin-right: 8px; color: var(--text); }
 
-  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
-  .badge.CE { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
-  .badge.PE { background: var(--red-bg); color: var(--red); border: 1px solid var(--red); }
-  .badge.WAIT { background: var(--surface2); color: var(--muted); border: 1px solid var(--line); }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: .03em; white-space: nowrap; }
+  .badge.CE { background: var(--green-bg); color: var(--green); }
+  .badge.PE { background: var(--red-bg); color: var(--red); }
+  .badge.WAIT { background: var(--surface2); color: var(--muted); }
 
   /* checklist */
-  .pips { display: flex; align-items: center; gap: 4px; margin-bottom: 5px; }
-  .pip { width: 22px; height: 6px; border-radius: 3px; background: var(--line); }
+  .pips { display: flex; align-items: center; gap: 4px; margin-bottom: 8px; }
+  .pip { width: 30px; height: 6px; border-radius: 3px; background: var(--sel); }
   .pip.on { background: var(--green); }
-  .pips span { margin-left: 6px; font-size: 12px; color: var(--muted); }
-  .group { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin: 6px 0 2px; }
-  .check { display: flex; gap: 7px; padding: 1px 0; align-items: flex-start; }
-  .check .ic { flex: none; width: 17px; height: 17px; border-radius: 50%; display: inline-flex; align-items: center;
-               justify-content: center; font-size: 11px; font-weight: 800; margin-top: 1px; }
+  .pips span { margin-left: 6px; font-size: 13px; color: var(--soft); }
+  .group { font-size: 10.5px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin: 10px 0 2px; }
+  .check { display: flex; gap: 12px; padding: 6px 0; align-items: flex-start; border-top: 1px solid var(--line); font-size: 12.5px; line-height: 1.35; }
+  .check .ic { flex: none; width: 18px; height: 18px; border-radius: 50%; display: inline-flex; align-items: center;
+               justify-content: center; font-size: 10px; font-weight: 800; }
   .check.ok .ic { background: var(--green-bg); color: var(--green); }
   .check.no .ic { background: var(--red-bg); color: var(--red); }
 
@@ -643,114 +709,98 @@ PAGE = r"""<!DOCTYPE html>
   .badge-src { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 6px; }
   .badge-src.live { background: var(--green-bg); color: var(--green); }
   .badge-src.est { background: var(--amber-bg); color: var(--amber); }
-  .box { margin-top: 6px; padding: 5px 9px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface2); font-size: 12.5px; }
-  .box.warn { border-color: var(--amber); background: var(--amber-bg); }
-  .box.agrees { border-color: var(--green); } .box.warns { border-color: var(--red); }
-  details { margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface2); }
-  details summary { cursor: pointer; padding: 6px 10px; font-weight: 700; list-style: none; }
+  .box { margin-top: 6px; padding: 6px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface2); font-size: 12.5px; }
+  .box.warn { border-color: var(--amber-bd); background: var(--amber-bg); }
+  .box.agrees { border-color: var(--green-bd); } .box.warns { border-color: var(--red-bd); }
+  details { margin-top: 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface2); }
+  details summary { cursor: pointer; padding: 8px 12px; font-weight: 600; list-style: none; min-height: 36px; display: flex; align-items: center; }
   details summary::-webkit-details-marker { display: none; }
   details summary::before { content: "\25B8"; display: inline-block; margin-right: 8px; transition: transform .15s; color: var(--muted); }
   details[open] summary::before { transform: rotate(90deg); }
-  details .inner { padding: 0 12px 8px 12px; }
+  details .inner { padding: 0 14px 12px; font-size: 12.5px; line-height: 1.6; color: var(--soft); }
   details ol { margin: 0; padding-left: 18px; } details li { padding: 2px 0; }
 
   /* scoreboard */
-  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 5px; }
-  .stat { background: var(--surface2); border-radius: 6px; padding: 3px 8px; text-align: center; }
-  .stat .n { font-size: 16px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.2; }
-  .stat .l { font-size: 11px; color: var(--muted); }
+  .stats { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .stat { flex: 1 1 90px; min-width: 0; background: var(--surface2); border-radius: 12px; padding: 8px 10px; display: flex; flex-direction: column-reverse; gap: 1px; }
+  .stat .n { font-size: 17px; font-weight: 700; font-family: var(--mono); letter-spacing: -.02em; }
+  .stat .l { font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; font-weight: 600; color: var(--muted); }
 
-  .list .item { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 0; border-top: 1px solid var(--line); }
+  .list .item { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 5px 0; border-top: 1px solid var(--line); font-size: 12.5px; }
   .list .item:first-child { border-top: 0; }
-  .list .t { color: var(--muted); font-size: 12px; }
+  .list .t { color: var(--muted); font-size: 12px; font-family: var(--mono); }
   .list .what { flex: 1; min-width: 0; }
-  #recent { max-height: 150px; overflow-y: auto; }
-  /* live analysis: the 4 steps and the recently dropped setups */
-  .steps { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 4px 0 8px; }
-  .step { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font-size: 12px; min-width: 0; }
-  .step .st { font-weight: 700; display: flex; justify-content: space-between; align-items: center; gap: 6px; white-space: nowrap; }
-  .step .sd { margin-top: 2px; color: var(--muted); line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2;
-              -webkit-box-orient: vertical; overflow: hidden; }
-  .step.ok { border-color: var(--green); background: var(--green-bg); } .step.ok .st { color: var(--green); }
-  .step.fail { border-color: var(--red); background: var(--red-bg); } .step.fail .st { color: var(--red); }
-  .step.wait { opacity: .6; }
-  #stepNote { font-size: 13px; line-height: 1.4; }
-  #rejected { max-height: 260px; overflow-y: auto; }
-  #rejected .item { display: block; }
-  #rejected .why { font-size: 12px; color: var(--muted); }
-  @media (min-width: 1100px) { #rejected { column-count: 2; column-gap: 18px; max-height: none; }
-                               #rejected .item { break-inside: avoid; } }
+  #recent { max-height: 220px; overflow-y: auto; }
+  #rejected { max-height: 360px; overflow-y: auto; }
+  #rejected .item { display: block; padding: 6px 0; }
+  #rejected .item:first-child { border-top: 1px solid var(--line); }
+  #rejected .why { font-size: 12.5px; color: var(--soft); line-height: 1.4; }
+  #rejected .t { margin-right: 6px; }
 
   /* history */
-  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 12px 0 6px; }
-  .tab { background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 4px 14px; font-weight: 700; color: var(--muted); }
-  .tab[aria-selected="true"] { color: var(--text); border-color: var(--blue); background: var(--blue-bg); }
-  .chips { display: flex; gap: 5px; flex-wrap: wrap; margin: 6px 0; }
-  .chip { background: var(--surface2); border: 1px solid var(--line); border-radius: 999px; padding: 2px 11px; font-size: 12.5px; color: var(--muted); font-weight: 600; }
-  .chip[aria-pressed="true"] { color: var(--text); border-color: var(--blue); background: var(--blue-bg); }
-  .sumline { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; }
-  .sumline b { font-variant-numeric: tabular-nums; }
+  .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; }
+  .tab { background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 0 14px; min-height: 36px; font-size: 13px; font-weight: 600; color: var(--soft); }
+  .tab[aria-selected="true"] { color: var(--text); background: var(--sel); }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+  .chip { background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 0 12px; min-height: 34px; font-size: 13px; color: var(--soft); font-weight: 600; }
+  .chip[aria-pressed="true"] { color: var(--text); background: var(--sel); }
+  .sumline { display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 13px; color: var(--soft); margin-bottom: 8px; }
+  .sumline b { font-family: var(--mono); color: var(--text); }
+  .sumline b.up { color: var(--green); } .sumline b.down { color: var(--red); }
   .hrow { display: grid; grid-template-columns: 120px minmax(0, 1fr) 100px 80px; gap: 8px; align-items: center;
-          padding: 5px 8px; border-top: 1px solid var(--line); cursor: pointer; border-radius: 6px; }
+          padding: 7px 4px; border-top: 1px solid var(--line); cursor: pointer; border-radius: 6px; }
   .hrow:hover { background: var(--surface2); }
-  .hrow .when { font-weight: 600; } .hrow .when small { margin-left: 6px; font-weight: 400; color: var(--muted); }
-  .hrow .r { text-align: right; font-weight: 800; font-variant-numeric: tabular-nums; }
-  .res { display: inline-block; padding: 1px 10px; border-radius: 999px; font-size: 11px; font-weight: 800; text-align: center;
-         background: var(--surface2); color: var(--muted); border: 1px solid var(--line); }
-  .res.SUCCESS { background: var(--green-bg); color: var(--green); border-color: var(--green); }
-  .res.FAILED { background: var(--red-bg); color: var(--red); border-color: var(--red); }
-  .res.TIME { background: var(--amber-bg); color: var(--amber); border-color: var(--amber); }
-  .hdetail { padding: 10px; background: var(--surface2); border: 1px solid var(--line); border-radius: 8px; margin: 2px 0 8px;
+  .hrow .when { font-weight: 600; font-family: var(--mono); font-size: 14px; } .hrow .when small { margin-left: 6px; font-weight: 400; font-size: 12px; font-family: var(--sans); color: var(--muted); }
+  .hrow .r { text-align: right; font-weight: 700; font-family: var(--mono); }
+  .res { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: .03em; text-align: center;
+         background: var(--surface2); color: var(--muted); }
+  .res.SUCCESS { background: var(--green-bg); color: var(--green); }
+  .res.FAILED { background: var(--red-bg); color: var(--red); }
+  .res.TIME { background: var(--amber-bg); color: var(--amber); }
+  .hdetail { padding: 10px; background: var(--surface2); border: 1px solid var(--line); border-radius: 10px; margin: 2px 0 8px;
              display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
   .hchart { height: 220px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
   .learn-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; margin-top: 8px; }
   .learn-grid .card { box-shadow: none; background: var(--surface2); }
 
-  .oi-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-bottom: 6px; }
-  .oi-row { display: grid; grid-template-columns: minmax(0, 1fr) 52px minmax(0, 1fr); gap: 6px; align-items: center;
-            font-size: 11px; padding: 1px 0; font-variant-numeric: tabular-nums; }
-  .oi-row .stk { text-align: center; font-weight: 700; }
-  .oi-row.near .stk { text-decoration: underline; }
-  .oi-bar { height: 12px; border-radius: 3px; min-width: 1px; opacity: .75; }
-  .oi-bar.ce { background: var(--red); }
-  .oi-bar.pe { background: var(--green); }
-  .oi-cell { display: flex; align-items: center; gap: 4px; min-width: 0; white-space: nowrap; }
+  /* option chain (open interest) */
+  .oi-sub { font-size: 12px; color: var(--muted); margin: 2px 0 8px; }
+  .oi-row { display: grid; grid-template-columns: minmax(0, 1fr) 54px minmax(0, 1fr); gap: 6px; align-items: center;
+            padding: 1px 4px; border-radius: 6px; font-family: var(--mono); }
+  .oi-row.near { background: var(--surface2); }
+  .oi-row .stk { text-align: center; font-size: 12px; font-weight: 700; padding: 2px 0; border-radius: 6px; }
+  .oi-row.near .stk { background: var(--text); color: var(--bg); }
+  .oi-head { font-family: var(--sans); font-size: 11px; font-weight: 600; color: var(--muted); padding-bottom: 6px; }
+  .oi-head .ce { text-align: right; color: var(--red); } .oi-head .pe { color: var(--green); } .oi-head .stk { color: var(--muted); }
+  .oi-cell { display: flex; align-items: center; gap: 6px; min-width: 0; white-space: nowrap; }
   .oi-cell.ce { justify-content: flex-end; }
-  .oi-head { color: var(--muted); font-weight: 700; }
-  .guide { margin-top: 12px; }
-  .guide ul { margin: 0; padding-left: 20px; } .guide li { padding: 2px 0; }
-  footer { padding: 10px 0 20px; color: var(--muted); font-size: 12px; }
+  .oi-v { font-size: 11.5px; min-width: 38px; }
+  .oi-cell.ce .oi-v { text-align: right; }
+  .oi-chg { font-size: 10.5px; color: var(--muted); }
+  .oi-bw { flex: none; width: 62px; height: 8px; display: flex; }
+  .oi-cell.ce .oi-bw { justify-content: flex-end; }
+  .oi-bar { min-width: 2px; height: 8px; }
+  .oi-bar.ce { background: var(--red); border-radius: 3px 0 0 3px; }
+  .oi-bar.pe { background: var(--green); border-radius: 0 3px 3px 0; }
+  .oi-facts { margin: 10px 0 0; padding: 10px 0 0 16px; border-top: 1px solid var(--line); font-size: 12px; line-height: 1.4; color: var(--soft); }
+  .oi-facts li { margin: 0 0 2px; }
 
-  /* ---------- screen sizes ---------- */
-  /* wide: chart | checklist + trade | candle + scoreboard, all in one row */
-  @media (min-width: 1500px) {
-    .grid { grid-template-columns: minmax(0, 1fr) 330px 310px; }
-    .left { display: contents; }
-    .chartcard { grid-column: 1; grid-row: 1; }
-    .mid { grid-column: 2; grid-row: 1; }
-    .lowcol { grid-column: 3; grid-row: 1; flex-direction: column; }
-    .lowcol > .card { flex: none; }
-    #cardRejected { grid-column: 1; grid-row: 2; }
-    #chart { height: clamp(320px, calc(100vh - 240px), 900px); }
-  }
+  .guide { margin-top: 0; background: var(--surface); border-radius: 12px; }
+  footer { margin: 0; padding: 0 0 20px; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+
+  /* ---------- small screens ---------- */
   @media (max-width: 1000px) {
-    .grid { grid-template-columns: 1fr; }
-    .mid, .lowcol { display: grid; grid-template-columns: 1fr 1fr; align-items: start; }
-    .decision { grid-template-columns: 1fr; gap: 8px; }
-    #chart { height: clamp(280px, 48vh, 460px); }
+    .hdetail { grid-template-columns: 1fr; }
   }
   @media (max-width: 640px) {
-    body { font-size: 14px; }
-    .brand h1 { font-size: 14px; }
+    .topbar { position: static; }
     .controls { margin-left: 0; }
-    .mid, .lowcol { grid-template-columns: 1fr; }
-    .decision h2 { font-size: 19px; }
+    .decision h2 { font-size: 22px; }
     .tiles { grid-template-columns: 1fr; }
     .tile { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
-    .ohlc { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .hrow { grid-template-columns: 1fr auto; row-gap: 2px; }
     .hrow .r { text-align: left; }
-    .hdetail { grid-template-columns: 1fr; }
+    #chart { height: clamp(280px, 48vh, 460px); }
   }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
@@ -759,11 +809,14 @@ PAGE = r"""<!DOCTYPE html>
 
 <header class="topbar">
   <div class="wrap">
-    <div class="brand"><h1>Candle Signal Dashboard</h1></div>
+    <div class="brand">
+      <span class="logo"><svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><line x1="5" y1="2" x2="5" y2="16" stroke="#2bd4b4" stroke-width="1.6"/><rect x="3" y="5" width="4" height="7" fill="#2bd4b4"/><line x1="13" y1="1" x2="13" y2="14" stroke="#ff7a70" stroke-width="1.6"/><rect x="11" y="3" width="4" height="7" fill="#ff7a70"/></svg></span>
+      <h1>Candle Signal<small>Dashboard</small></h1>
+    </div>
     <div class="status" aria-live="polite">
       <span class="pill" id="pMarket"><span class="dot"></span><span id="pMarketText">Connecting...</span></span>
       <span class="pill" id="pData" style="display:none"><span class="dot"></span><span id="pDataText"></span></span>
-      <span class="muted small" id="updated">Loading...</span>
+      <span class="small" id="updated">Loading...</span>
     </div>
     <div class="controls">
       <div class="seg" id="indexSeg" role="group" aria-label="Market">
@@ -781,7 +834,7 @@ PAGE = r"""<!DOCTYPE html>
           <option value="yahoo">Yahoo (free)</option>
         </select>
       </label>
-      <button class="btn" id="refresh" type="button">&#x21BB; Refresh</button>
+      <button class="btn" id="refresh" type="button"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>Refresh</button>
       <button class="btn icon" id="themeBtn" type="button" aria-label="Switch light or dark theme" title="Switch light / dark">&#x263E;</button>
     </div>
   </div>
@@ -790,74 +843,55 @@ PAGE = r"""<!DOCTYPE html>
 <div class="wrap">
   <div id="error" role="alert"><span id="errorText"></span><button type="button" id="errorClose" aria-label="Dismiss">&times;</button></div>
 
-  <!-- THE ANSWER -->
+<main class="page">
+
+  <!-- THE ANSWER + the four steps -->
   <section class="decision none" id="decision" aria-live="polite" aria-label="Trade decision">
-    <div>
-      <div class="kickrow">
-        <div class="kicker" id="dKicker">Trade idea</div>
-        <div class="tag" id="dTag" style="display:none"></div>
+    <div class="dmain">
+      <div class="dleft">
+        <span class="dicon" id="dIcon" aria-hidden="true"></span>
+        <div class="dtext">
+          <div class="kickrow">
+            <div class="kicker" id="dKicker">Trade idea</div>
+            <div class="tag" id="dTag" style="display:none"></div>
+          </div>
+          <h2 id="dTitle">Loading latest candles...</h2>
+          <div class="sub" id="dSub">Please wait a moment.</div>
+        </div>
       </div>
-      <h2 id="dTitle">Loading latest candles...</h2>
-      <div class="sub" id="dSub">Please wait a moment.</div>
+      <div class="dright">
+        <div class="steps" id="anSteps"></div>
+        <div class="stepcap"><span id="stepNote"></span> <span id="anNext"></span></div>
+        <div class="tiles-wrap" id="dRight"></div>
+      </div>
     </div>
-    <div class="tiles-wrap" id="dRight"></div>
+    <div class="dstrip" id="dStrip"></div>
   </section>
 
-  <div class="grid">
-    <div class="left">
-      <section class="card chartcard">
+  <!-- TIER 1: decide -->
+  <div class="tier">
+    <div class="t1main">
+      <section class="card chartcard" aria-label="Price chart">
         <div class="chart-head">
           <div class="ch-left">
-            <span class="muted small" id="chartTitle">NIFTY 50 &middot; 5 min</span>
-            <span><span class="price" id="price">--</span><span class="change" id="change"></span></span>
+            <span id="chartTitle">NIFTY 50 &middot; 5 min</span>
+            <span class="pricebox"><span class="price" id="price">--</span><span class="change" id="change"></span></span>
           </div>
           <div class="legend">
             <span><b class="up">&#x25B2;</b> leans CE (up)</span>
             <span><b class="down">&#x25BC;</b> leans PE (down)</span>
             <span><b>&bull;</b> wait</span>
+            <span><i class="lg" style="background:#f3b94d"></i>VWAP</span>
+            <span><i class="lg" style="background:#4da3ff"></i>EMA 9</span>
+            <span><i class="lg" style="background:#b48bff"></i>EMA 21</span>
+            <button class="btn" id="resetView" type="button">Reset view</button>
           </div>
-          <button class="btn" id="resetView" type="button">Reset view</button>
         </div>
         <div id="chart"></div>
-      </section>
-
-      <div class="col lowcol">
-        <section class="card">
-          <h3>Latest finished candle <span class="hint" id="lcTime"></span></h3>
-          <div class="ohlc">
-            <div><div class="lbl">Open</div><div class="val" id="lcO">--</div></div>
-            <div><div class="lbl">High</div><div class="val" id="lcH">--</div></div>
-            <div><div class="lbl">Low</div><div class="val" id="lcL">--</div></div>
-            <div><div class="lbl">Close</div><div class="val" id="lcC">--</div></div>
-            <div><div class="lbl">Colour</div><div class="val" id="lcColour">--</div></div>
-            <div><div class="lbl">Trend before</div><div class="val" id="lcTrend">--</div></div>
-          </div>
-          <div id="patterns"></div>
-        </section>
-
-        <section class="card">
-          <h3>Recent candle patterns</h3>
-          <div id="recent" class="list muted">--</div>
-        </section>
-      </div>
-
-      <section class="card" id="cardRejected">
-        <h3>Recent setups with no idea <span class="hint">(a pattern appeared, but a rule said no)</span></h3>
-        <div id="rejected" class="list muted">--</div>
+        <div class="ftiles" id="factTiles"></div>
       </section>
     </div>
-
-    <div class="col mid">
-      <section class="card" id="cardAnalysis">
-        <h3>Live analysis <span class="hint" id="anNext"></span></h3>
-        <div class="steps" id="anSteps"></div>
-        <div id="stepNote" class="muted">--</div>
-        <div id="anFacts" class="muted small" style="margin-top:4px"></div>
-      </section>
-      <section class="card" id="cardChain">
-        <h3>Option chain (open interest) <span class="hint" id="oiMeta"></span></h3>
-        <div id="oiBody" class="muted">--</div>
-      </section>
+    <div class="col t1side">
       <section class="card" id="cardWhy">
         <h3>Why this decision</h3>
         <div id="why" class="muted">--</div>
@@ -866,32 +900,80 @@ PAGE = r"""<!DOCTYPE html>
         <h3>Trade details</h3>
         <div id="trade"></div>
       </section>
-      <section class="card">
-        <h3>Paper-trade scoreboard <span class="hint">(automatic, no real money)</span></h3>
+    </div>
+  </div>
+
+  <!-- TIER 2: context -->
+  <div class="tier top">
+    <div class="col t2a">
+      <section class="card" aria-label="Latest finished candle">
+        <h3>Latest finished candle <span class="hint" id="lcTime"></span></h3>
+        <div class="lcwrap">
+          <svg id="lcSvg" width="44" height="104" viewBox="0 0 44 104" role="img" aria-label="Latest candle shape"></svg>
+          <div class="ohlc">
+            <div><div class="lbl">Open</div><div class="val" id="lcO">--</div></div>
+            <div><div class="lbl">High</div><div class="val" id="lcH">--</div></div>
+            <div><div class="lbl">Low</div><div class="val" id="lcL">--</div></div>
+            <div><div class="lbl">Close</div><div class="val" id="lcC">--</div></div>
+          </div>
+        </div>
+        <div class="lctiles">
+          <div><div class="lbl">Colour</div><div class="val" id="lcColour">--</div></div>
+          <div><div class="lbl">Trend before</div><div class="val" id="lcTrend">--</div></div>
+        </div>
+        <div id="patterns"></div>
+      </section>
+      <section class="card" aria-label="Recent candle patterns">
+        <h3>Recent candle patterns</h3>
+        <div id="recent" class="list muted">--</div>
+      </section>
+    </div>
+    <div class="col t2b">
+      <section class="card" id="cardChain" aria-label="Option chain">
+        <h3>Option chain (open interest) <span class="hint">&middot; context only</span></h3>
+        <div class="oi-sub" id="oiMeta"></div>
+        <div id="oiBody" class="muted">--</div>
+      </section>
+    </div>
+    <div class="col t2c">
+      <section class="card" aria-label="Paper-trade scoreboard">
+        <h3>Paper-trade scoreboard <span class="hint">automatic, no real money</span></h3>
         <div id="journal" class="muted">--</div>
       </section>
     </div>
   </div>
 
-  <!-- HISTORY / MEMORY -->
-  <div class="tabs" role="tablist">
-    <button class="tab" role="tab" id="tabBtnHistory" aria-selected="true" type="button">Idea history</button>
-    <button class="tab" role="tab" id="tabBtnLearned" aria-selected="false" type="button">What the tool learned</button>
-  </div>
-  <section class="card" id="tabHistory">
-    <div id="histSummary" class="sumline muted">Loading...</div>
-    <div class="chips" id="histChips">
-      <button class="chip" data-f="ALL" type="button">All</button>
-      <button class="chip" data-f="SUCCESS" type="button">Success</button>
-      <button class="chip" data-f="FAILED" type="button">Failed</button>
-      <button class="chip" data-f="TIME EXIT" type="button">Time exit</button>
-      <button class="chip" data-f="WAITING" type="button">Waiting</button>
+  <!-- TIER 3: track record and logs -->
+  <div class="tier top">
+    <div class="col t3a">
+      <section class="card" aria-label="Idea history">
+        <div class="tabs" role="tablist">
+          <button class="tab" role="tab" id="tabBtnHistory" aria-selected="true" type="button">Idea history</button>
+          <button class="tab" role="tab" id="tabBtnLearned" aria-selected="false" type="button">What the tool learned</button>
+        </div>
+        <div id="tabHistory">
+          <div id="histSummary" class="sumline muted">Loading...</div>
+          <div class="chips" id="histChips" role="group" aria-label="Filter ideas">
+            <button class="chip" data-f="ALL" type="button">All</button>
+            <button class="chip" data-f="SUCCESS" type="button">Success</button>
+            <button class="chip" data-f="FAILED" type="button">Failed</button>
+            <button class="chip" data-f="TIME EXIT" type="button">Time exit</button>
+            <button class="chip" data-f="WAITING" type="button">Waiting</button>
+          </div>
+          <div id="histList"></div>
+        </div>
+        <div id="tabLearned" style="display:none">
+          <div id="learned" class="muted">Loading...</div>
+        </div>
+      </section>
     </div>
-    <div id="histList"></div>
-  </section>
-  <section class="card" id="tabLearned" style="display:none">
-    <div id="learned" class="muted">Loading...</div>
-  </section>
+    <div class="col t3b">
+      <section class="card" id="cardRejected" aria-label="Recent setups with no idea">
+        <h3>Recent setups with no idea <span class="hint">a pattern appeared, but a rule said no</span></h3>
+        <div id="rejected" class="list muted">--</div>
+      </section>
+    </div>
+  </div>
 
   <details class="guide">
     <summary>Quick guide: how to read this page</summary>
@@ -911,6 +993,7 @@ PAGE = r"""<!DOCTYPE html>
     The last candle on the chart may still be running; analysis uses only finished candles. Candle patterns alone are not a trade signal.
     Personal use only. Not financial advice.
   </footer>
+</main>
 </div>
 
 <script>
@@ -942,7 +1025,7 @@ const NAMES = { nifty: 'NIFTY 50', sensex: 'SENSEX' };
 
 // ---------------- theme + charts ----------------
 const THEMES = {
-  dark:  { bg: '#131925', text: '#c4cad6', grid: '#1e2535', border: '#2a3246', up: '#26a69a', down: '#ef5350' },
+  dark:  { bg: '#131920', text: '#9aa8b6', grid: '#1a222c', border: '#263140', up: '#2bd4b4', down: '#ff7a70' },
   light: { bg: '#ffffff', text: '#2b3445', grid: '#eceff5', border: '#d5dbe7', up: '#0d8f7d', down: '#d03a37' },
 };
 let theme = store.get('cs.theme', 'dark') === 'light' ? 'light' : 'dark';
@@ -956,6 +1039,19 @@ const seriesOptions = (c) => ({ upColor: c.up, downColor: c.down, borderVisible:
 
 const chart = LightweightCharts.createChart($('chart'), Object.assign({ autoSize: true, crosshair: { mode: 0 } }, chartOptions(THEMES[theme])));
 const series = chart.addCandlestickSeries(seriesOptions(THEMES[theme]));
+// indicator lines: VWAP (amber, dashed, one piece per day) and the EMA 9 / EMA 21 the rules use
+const LINE_COLORS = { vwap: '#f3b94d', ema9: '#4da3ff', ema21: '#b48bff' };
+const lineOpts = (color, width, style) => ({ color: color, lineWidth: width, lineStyle: style, priceLineVisible: false,
+  lastValueVisible: false, crosshairMarkerVisible: false });
+const ema9Series = chart.addLineSeries(lineOpts(LINE_COLORS.ema9, 1, 0));
+const ema21Series = chart.addLineSeries(lineOpts(LINE_COLORS.ema21, 1, 0));
+let vwapSeries = [];
+function setIndicatorLines(l) {
+  ema9Series.setData(l.ema9); ema21Series.setData(l.ema21);
+  while (vwapSeries.length > l.vwap.length) chart.removeSeries(vwapSeries.pop());
+  while (vwapSeries.length < l.vwap.length) vwapSeries.push(chart.addLineSeries(lineOpts(LINE_COLORS.vwap, 2, 2)));
+  l.vwap.forEach((points, i) => vwapSeries[i].setData(points));
+}
 let detailChart = null, detailSeries = null;
 
 function applyTheme(t) {
@@ -1013,25 +1109,38 @@ function tile(cls, label, value, note) {
 }
 
 // ---------------- decision banner ----------------
+const ICONS = {
+  none: '<path d="M8 5v14M16 5v14"/>',
+  ce: '<path d="M12 19V5M5 12l7-7 7 7"/>',
+  pe: '<path d="M12 5v14M5 12l7 7 7-7"/>',
+};
+function setIcon(kind) {
+  $('dIcon').innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" ' +
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + ICONS[kind] + '</svg>';
+}
 function renderDecision(d) {
   const p = d.plan;
   const box = $('decision');
   const right = clear($('dRight'));
   const tag = $('dTag');
+  const strip = $('dStrip');
   const practice = d.delayed
     ? 'Practice only: data is about ' + d.data_lag_min + ' min old (free Yahoo is delayed). Use Angel One for live data.'
     : (!d.market_open ? 'Practice only: market is closed, this is the last session.' : '');
 
   if (p.signal === 'NONE') {
     box.className = 'decision none';
+    setIcon('none');
     $('dKicker').textContent = 'Trade idea';
     $('dTitle').textContent = 'No trade right now';
     $('dSub').textContent = p.message || d.summary;
-    right.appendChild(h('div', 'empty-hint', 'Most of the time there is no good setup, and that is normal. The filters are strict on purpose. ' +
-      'Waiting is a decision. The checklist on the right shows what is missing.'));
+    strip.textContent = 'Most of the time there is no good setup, and that is normal. The filters are strict on purpose. ' +
+      'Waiting is a decision. The checklist on the right shows what is missing.';
   } else {
     const isCE = p.signal === 'CE';
     box.className = 'decision ' + (isCE ? 'ce' : 'pe');
+    setIcon(isCE ? 'ce' : 'pe');
+    strip.textContent = '';
     $('dKicker').textContent = 'Trade idea \u00B7 ' + (isCE ? 'bullish' : 'bearish');
     $('dTitle').textContent = (isCE ? 'Buy CE (call)' : 'Buy PE (put)') + ' idea';
     $('dSub').textContent = p.status || 'A setup is confirmed.';
@@ -1058,26 +1167,46 @@ function renderDecision(d) {
   tag.textContent = practice;
 }
 
-// ---------------- live analysis (4 steps + dropped setups) ----------------
+// ---------------- live analysis (4 steps in the banner, facts under the chart, dropped setups) ----------------
+function factTile(label, value, note, cls) {
+  return h('div', 'ftile', null, [h('span', 'lbl', label), h('span', 'val' + (cls ? ' ' + cls : ''), value), note ? h('div', 'note', note) : null]);
+}
+function factFromText(f) {
+  let m;
+  if ((m = /^(.*?) ([\d,]+) \(price is (above|below)\)$/.exec(f))) return factTile(m[1], m[2], 'Price is ' + m[3], 'amber');
+  if ((m = /^Opening gap ([+-][\d.]+%)$/.exec(f))) return factTile('Opening gap', m[1], 'vs previous close');
+  if ((m = /^Volume ([\d.]+)x average$/.exec(f))) return factTile('Volume', m[1] + '\u00D7', 'of average');
+  if (/^Volume not available/.test(f)) return factTile('Volume', '--', 'not available for this data');
+  return factTile('Fact', f, '');
+}
+const STEP_MARK = {
+  ok: ['Pass', '<path d="M4 12.5l5 5L20 6.5"/>'],
+  fail: ['Fail', '<path d="M6 6l12 12M18 6L6 18"/>'],
+  wait: ['Waiting', '<path d="M5 12h14"/>'],
+};
 function renderAnalysis(d) {
-  const a = d.analysis, stepsBox = clear($('anSteps')), note = $('stepNote'), rej = clear($('rejected'));
+  const a = d.analysis, stepsBox = clear($('anSteps')), note = $('stepNote'), rej = clear($('rejected')), ft = clear($('factTiles'));
   if (!a) { note.textContent = 'Analysis is not available right now.'; rej.textContent = '--'; $('anNext').textContent = ''; return; }
-  $('anNext').textContent = a.next_candle_closes ? '· next candle closes ' + a.next_candle_closes : '';
-  const icon = { ok: '✔', fail: '✘', wait: '…' };
+  $('anNext').textContent = a.next_candle_closes ? '\u00B7 next candle closes ' + a.next_candle_closes : '';
   a.steps.forEach((s, n) => {
+    const mark = STEP_MARK[s.state] || STEP_MARK.wait;
+    const sr = h('span', 'sr');
+    sr.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" ' +
+      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + mark[1] + '</svg>';
+    sr.appendChild(document.createTextNode(mark[0]));
     const el = h('div', 'step ' + s.state, null, [
-      h('div', 'st', null, [h('span', null, (n + 1) + '. ' + s.title), h('span', null, icon[s.state])]),
+      h('div', 'st', null, [h('span', null, (n + 1) + '. ' + s.title), sr]),
       h('div', 'sd', s.detail),
     ]);
     el.title = s.detail;
     stepsBox.appendChild(el);
   });
   note.textContent = a.headline;
-  $('anFacts').textContent = a.facts && a.facts.length ? a.facts.join('  ·  ') : '';
+  (a.facts || []).forEach((f) => ft.appendChild(factFromText(f)));
   if (!a.rejected.length) { rej.textContent = 'None in the recent candles.'; return; }
   a.rejected.forEach((r) => {
     rej.appendChild(h('div', 'item', null, [
-      h('div', null, null, [h('span', 't', r.time + '  '), document.createTextNode(r.setup)]),
+      h('div', null, null, [h('span', 't', r.time + '  '), h('b', null, r.setup)]),
       h('div', 'why', 'Dropped: ' + r.why),
     ]));
   });
@@ -1089,29 +1218,31 @@ function renderChain(d) {
   meta.textContent = '';
   if (!c) { box.className = 'muted'; box.textContent = 'No option data yet. Run: python candle_store.py backfill-options'; return; }
   box.className = '';
-  meta.textContent = '\u00B7 expiry ' + c.expiry + ' \u00B7 ' + (c.source === 'live' ? 'live ' + c.as_of : 'saved ' + c.as_of);
+  meta.textContent = 'Expiry ' + c.expiry + ' \u00B7 ' + (c.source === 'live' ? 'live ' + c.as_of : 'saved ' + c.as_of);
   const oi = (n) => n >= 1e5 ? (n / 1e5).toFixed(1) + 'L' : n >= 1e3 ? (n / 1e3).toFixed(0) + 'k' : String(Math.round(n));
   const sgn = (n) => (n > 0 ? '+' : n < 0 ? '-' : '') + oi(Math.abs(n));
-  const tiles = h('div', 'oi-tiles');
-  tiles.appendChild(tile('', 'Put/call OI', c.pcr === null ? '--' : c.pcr.toFixed(2), ''));
-  tiles.appendChild(tile('', 'Call wall', c.call_wall ? String(c.call_wall.strike) : '--', 'most call OI'));
-  tiles.appendChild(tile('', 'Put wall', c.put_wall ? String(c.put_wall.strike) : '--', 'most put OI'));
-  box.appendChild(tiles);
+  const ft = $('factTiles');
+  ft.appendChild(factTile('Put/Call OI', c.pcr === null ? '--' : c.pcr.toFixed(2),
+    c.pcr === null ? '' : (c.pcr > 1 ? 'more puts than calls' : 'more calls than puts')));
+  if (c.call_wall) ft.appendChild(factTile('Call wall', String(c.call_wall.strike), 'most call OI', 'down'));
+  if (c.put_wall) ft.appendChild(factTile('Put wall', String(c.put_wall.strike), 'most put OI', 'up'));
   const max = Math.max(1, ...c.rows.map((r) => Math.max(r.ce || 0, r.pe || 0)));
   let near = c.rows[0];
   c.rows.forEach((r) => { if (Math.abs(r.strike - c.spot) < Math.abs(near.strike - c.spot)) near = r; });
-  box.appendChild(h('div', 'oi-row oi-head', null, [h('div', null, 'Calls (CE)'), h('div', 'stk', 'Strike'), h('div', null, 'Puts (PE)')]));
+  box.appendChild(h('div', 'oi-row oi-head', null, [h('span', 'ce', 'Calls (CE)'), h('span', 'stk', 'Strike'), h('span', 'pe', 'Puts (PE)')]));
   c.rows.forEach((r) => {
     const cell = (side) => {
       const v = r[side], chg = r[side + '_chg'];
-      const bar = h('div', 'oi-bar ' + side);
-      bar.style.width = (v ? Math.max(2, v / max * 100) * 0.5 : 0) + '%';
-      const txt = h('span', null, v === null ? '--' : oi(v) + (chg === null ? '' : ' (' + sgn(chg) + ')'));
-      return h('div', 'oi-cell ' + side, null, side === 'ce' ? [txt, bar] : [bar, txt]);
+      const bar = h('span', 'oi-bar ' + side);
+      bar.style.width = (v ? Math.max(5, v / max * 100) : 0) + '%';
+      const val = h('span', 'oi-v', v === null ? '--' : oi(v));
+      const delta = h('span', 'oi-chg', chg === null ? '' : sgn(chg));
+      const bw = h('span', 'oi-bw', null, [bar]);
+      return h('div', 'oi-cell ' + side, null, side === 'ce' ? [delta, val, bw] : [bw, val, delta]);
     };
     box.appendChild(h('div', 'oi-row' + (r === near ? ' near' : ''), null, [cell('ce'), h('div', 'stk', String(r.strike)), cell('pe')]));
   });
-  box.appendChild(h('div', 'muted small', null, c.facts.map((f) => h('div', null, f))));
+  box.appendChild(h('ul', 'oi-facts', null, c.facts.map((f) => h('li', null, f))));
 }
 
 // ---------------- why (checklist) ----------------
@@ -1184,8 +1315,8 @@ function renderTrade(d) {
   box.appendChild(det);
 
   addLine(p.entry, '#4da3ff', 'ENTRY');
-  addLine(p.stop, '#ef5350', 'STOP LOSS');
-  addLine(p.target, '#26a69a', 'TARGET');
+  addLine(p.stop, '#ff7a70', 'STOP LOSS');
+  addLine(p.target, '#2bd4b4', 'TARGET');
 }
 
 // ---------------- scoreboard ----------------
@@ -1218,6 +1349,18 @@ function renderJournal(j) {
 }
 
 // ---------------- latest candle + recent ----------------
+function drawMiniCandle(l) {
+  const svg = clear($('lcSvg')), NS = 'http://www.w3.org/2000/svg';
+  const range = (l.high - l.low) || 1, y = (v) => 12 + (l.high - v) / range * 80;
+  const col = l.colour === 'GREEN' ? 'var(--green)' : l.colour === 'RED' ? 'var(--red)' : 'var(--muted)';
+  const wick = document.createElementNS(NS, 'line');
+  [['x1', 22], ['y1', y(l.high)], ['x2', 22], ['y2', y(l.low)], ['stroke', col], ['stroke-width', 2]].forEach(([k, v]) => wick.setAttribute(k, v));
+  const top = Math.min(y(l.open), y(l.close)), hgt = Math.max(1.5, Math.abs(y(l.open) - y(l.close)));
+  const body = document.createElementNS(NS, 'rect');
+  [['x', 16], ['y', top], ['width', 12], ['height', hgt], ['fill', col]].forEach(([k, v]) => body.setAttribute(k, v));
+  svg.appendChild(wick); svg.appendChild(body);
+}
+
 function renderCandle(d) {
   const l = d.latest;
   $('lcTime').textContent = '\u00B7 ' + l.time;
@@ -1227,6 +1370,7 @@ function renderCandle(d) {
   colourEl.textContent = l.colour.charAt(0) + l.colour.slice(1).toLowerCase();
   colourEl.className = 'val ' + (l.colour === 'GREEN' ? 'up' : l.colour === 'RED' ? 'down' : '');
   $('lcTrend').textContent = l.trend_before.charAt(0) + l.trend_before.slice(1).toLowerCase();
+  drawMiniCandle(l);
 
   const box = clear($('patterns'));
   if (!l.patterns.length) {
@@ -1299,11 +1443,11 @@ async function drawSnapshot(key, box) {
     ser.setData(s.candles);
     const line = (price, color, title) => { if (price !== null) ser.createPriceLine({
       price: price, color: color, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: title }); };
-    line(s.entry, '#4da3ff', 'ENTRY'); line(s.stop, '#ef5350', 'STOP'); line(s.target, '#26a69a', 'TARGET');
+    line(s.entry, '#4da3ff', 'ENTRY'); line(s.stop, '#ff7a70', 'STOP'); line(s.target, '#2bd4b4', 'TARGET');
     const marks = [{ time: s.signal_time, position: s.side === 'CE' ? 'belowBar' : 'aboveBar',
                      color: '#4da3ff', shape: s.side === 'CE' ? 'arrowUp' : 'arrowDown', text: 'signal' }];
     if (s.exit_time) {
-      const col = s.status === 'TARGET' ? '#26a69a' : s.status === 'STOP' ? '#ef5350' : '#f5a524';
+      const col = s.status === 'TARGET' ? '#2bd4b4' : s.status === 'STOP' ? '#ff7a70' : '#f3b94d';
       marks.push({ time: s.exit_time, position: 'aboveBar', color: col, shape: 'circle',
                    text: s.status === 'TARGET' ? 'target hit' : s.status === 'STOP' ? 'stop hit' : 'time exit' });
     }
@@ -1461,6 +1605,7 @@ async function load() {
     hideError();
     series.setData(d.candles);
     series.setMarkers(d.markers);
+    if (d.lines) setIndicatorLines(d.lines);
     lastN = d.candles.length;
     if (needFit) { fitRecent(); needFit = false; }
     render(d);
