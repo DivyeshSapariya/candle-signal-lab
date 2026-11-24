@@ -26,6 +26,7 @@ from data_sources import INTERVAL_MINUTES
 
 BLOCKS = 4
 COSTS = (0.0, 0.1, 0.2, 0.3)
+OI_MIN_DAYS = 60              # open-interest checks are judged only with at least this many saved days
 MIN_GROUP = 8                 # smaller groups are not shown in the breakdown
 
 
@@ -67,6 +68,31 @@ def breakdown(trades: list, key):
     return sorted(rows, key=lambda r: -r[2])
 
 
+def oi_section(f, index: str, interval_min: int):
+    """
+    6) Open-interest checks. They only exist for the days the option chain was saved, so the default rules and
+    each check are compared on THOSE days only. With fewer than OI_MIN_DAYS days no numbers are shown at all.
+    """
+    print("\n6) OPEN-INTEREST CHECKS (default rules + one OI check, only on days that have OI)")
+    have = f["oi_pcr"].notna().values
+    days = len(pd.unique(f["day"][have]))
+    if days < OI_MIN_DAYS:
+        print(f"   Not enough history yet: {days} of {OI_MIN_DAYS} trading days with saved open interest. "
+              "No numbers are shown on purpose (a few days would only show luck). "
+              "It grows by one day per trading day (python candle_store.py backfill-options).")
+        return
+    idx = np.where(have)[0]
+    lo, hi = int(idx[0]), int(idx[-1])
+    base = run_backtest(f, index, interval_min, None, REWARD_TO_RISK, COST_R, i_start=lo, i_end=hi)
+    print(f"   {days} days with open interest")
+    print("  ", one_line("Default rules", stats(base, REWARD_TO_RISK, COST_R)))
+    for name in ("oi_pcr", "oi_wall", "oi_flow"):
+        trades = run_backtest(f, index, interval_min, {name: True}, REWARD_TO_RISK, COST_R, i_start=lo, i_end=hi)
+        print("  ", one_line(f"+ {FILTER_LABELS[name]}"[:44], stats(trades, REWARD_TO_RISK, COST_R)))
+    print("   A check only counts as useful if it passes the strategy-lab gate (positive in 3 of 4 blocks, "
+          "95% range above zero), not just a better average.")
+
+
 def report(index: str, interval: str, db: str):
     df = candle_store.load_candles(index, interval, db)
     fut = candle_store.load_futures(index, interval, db)
@@ -74,7 +100,9 @@ def report(index: str, interval: str, db: str):
         print(f"\n{index.upper()} {interval}: not enough saved candles (run: python candle_store.py collect)")
         return
     interval_min = INTERVAL_MINUTES[interval]
-    f = compute_features(df, index, interval_min, candle_store.load_vix(db), fut if len(fut) else None)
+    chain = candle_store.load_option_chain(index, db)
+    f = compute_features(df, index, interval_min, candle_store.load_vix(db), fut if len(fut) else None,
+                         chain if len(chain) else None)
     real = int((~f["vwap_proxy"]).sum())
     print(f"Futures volume covers {real} of {len(f)} candles"
           f"{'' if real else ' (none saved yet: run python candle_store.py backfill-futures)'}")
@@ -121,6 +149,8 @@ def report(index: str, interval: str, db: str):
         print("  ", one_line(f"+ {FILTER_LABELS[name]}"[:44], stats(trades, REWARD_TO_RISK, COST_R)))
     if f["vwap_proxy"].any():
         print("   (On days without futures volume, VWAP is the plain average price of the day.)")
+
+    oi_section(f, index, interval_min)
 
     print(f"\n4) BREAKDOWN (groups of {MIN_GROUP}+ trades only; for ideas, not proof)")
     for title, key in (

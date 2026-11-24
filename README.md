@@ -24,7 +24,7 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `live_monitor.py` | Text-only live watcher (simple version). |
 | `candle_store.py` | Your own candle database. Saves NIFTY / SENSEX candles and India VIX into `market_data.db`. Can also download a year of history, the futures volume and the option chain (open interest) from Angel One (see section 3b). |
 | `candle_analysis.py` | Explains the decision for the dashboard: the 4-step "Live analysis" card and the list of recent setups that were dropped, and why (section 3). It adds no rules. |
-| `candle_chain.py` | Turns option open interest into the plain facts of the dashboard's Option chain card (put/call ratio, walls, change). It adds no rules. |
+| `candle_chain.py` | Turns option open interest into the plain facts of the dashboard's Option chain card (put/call ratio, walls, change), and builds the open-interest features for the optional `oi_*` checks (section 5). |
 | `candle_research.py` | Honest checks on your saved candles: walk-forward blocks, cost stress, uncertainty range, breakdowns, extra checks (section 7c). |
 | `strategy_lab.py` | Tests other strategy types (opening-range breakout, VWAP pullback, trend continuation, mean reversion) on your saved candles against a strict pass/fail gate (section 7d). Changes no live rules. |
 | `candle_baseline.py` | Reality check: compares the strategy with random entries (same exits, costs and stop sizes) to see if it beats chance (see section 7b). |
@@ -33,6 +33,7 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `test_candle_research.py` | Checks the research maths, and the VWAP / volume / gap features (no look-ahead). |
 | `test_strategy_lab.py` | Checks the strategy lab: no look-ahead, same simulator and costs as the main backtest, and that random data fails the gate. |
 | `test_candle_chain.py` | Checks the open-interest facts (last value per day, previous session, walls, edge cases). |
+| `test_oi_filters.py` | Checks the open-interest features and the three optional `oi_*` checks: right numbers, no look-ahead, off by default, no numbers on thin history. |
 | `test_option_chain.py` | Checks the option-chain saving with a fake Angel One (nearest expiry, strikes, no duplicates, no running candle). |
 | `test_candle_backfill.py` | Checks the Angel One downloader and the rate-limit handling with a fake Angel One (no login, no internet). |
 | `telegram_notify.py` | Sends a short Telegram message when a new idea appears and when it ends (see section 3c). Also has the setup helpers `--check`, `--test` and `--find-chat`. |
@@ -86,7 +87,7 @@ Tip: you do not have to activate the environment. You can also run any command w
 | Check that the rules never use the future | `python test_no_lookahead.py` |
 | Telegram: check the settings / send a test message / find the group id | `python telegram_notify.py --check` / `--test` / `--find-chat` |
 | Test the Telegram alerts (no real bot needed) | `python test_telegram_notify.py` |
-| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_candle_chain.py`, `python test_strategy_lab.py` |
+| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_candle_chain.py`, `python test_oi_filters.py`, `python test_strategy_lab.py` |
 
 Stop any of them with **Ctrl + C**.
 
@@ -181,7 +182,7 @@ Saves what other traders are holding: for the **nearest expiry**, the at-the-mon
 - Safe to repeat: running it again updates rows, never duplicates them. The running candle is never saved, and one failing contract does not stop the others. A contract that expires today is still saved after the close.
 - **Expired contracts cannot be downloaded**, so OI history cannot go back in time: it grows by one trading day per day through the daily schedule (the first run saved 19 to 23 Nov 2026). The strikes saved follow the index level on the day it is run.
 - Read it in your own code with `load_option_chain("nifty")` (columns: expiry, strike, side, close, volume, oi).
-- **Shown, not used for decisions:** the dashboard's Option chain card shows OI as plain facts (section 3). No rule or alert uses it. The plan is to test it as a filter with `candle_research.py` and `strategy_lab.py` only after a few months of history exist.
+- **Shown, not used for decisions:** the dashboard's Option chain card shows OI as plain facts (section 3). No rule or alert uses it. The three optional `oi_*` checks and their research section are built but off (section 5); they are judged with `candle_research.py` (section 6) once 60 days of history exist.
 
 ---
 
@@ -312,6 +313,11 @@ Think of a doctor: he does not diagnose from one symptom. He checks several test
 | VWAP | CE only when the price is above today's VWAP, PE only when it is below. VWAP = today's average price weighted by the **futures** volume. On a day with no volume data it is the plain average price of the day, and the checklist says "average price of the day" instead of VWAP. | **On** |
 | Volume | The candle's futures volume must be at least its recent 20-candle average. | Off. Not enough futures history yet to judge it. |
 | Opening gap | Not trading against a gap bigger than 0.3% (for example a CE after a gap down). | Off. Helped some markets and hurt others in the tests. |
+| `oi_pcr` | Put/call open-interest ratio above 1.0 for a CE, below 1.0 for a PE. | Off. Research only: not enough OI history. |
+| `oi_wall` | No CE when the price is within 1 ATR under the call wall (most call OI); no PE within 1 ATR over the put wall. | Off. Research only. |
+| `oi_flow` | In the last 30 minutes put OI built up more than call OI for a CE, less for a PE. | Off. Research only. |
+
+The three `oi_*` checks use the saved option-chain history (section 3b), with fixed untuned thresholds. A candle uses only OI bars that had finished before it closed, and a candle with no recent OI (older than 20 minutes, or fewer than 6 strikes per side) simply skips the check. **They do nothing in the live dashboard**, which does not compute these features: switching one on in `DEFAULT_FILTERS` only affects research and backtests that pass the saved option table to `compute_features(..., chain=load_option_chain(index))`.
 
 Switch them in `DEFAULT_FILTERS` and let `candle_research.py` (section 7c) judge the change. Volume and gap are also shown as plain facts in the Live analysis card whether or not the check is on.
 
@@ -417,6 +423,7 @@ Run `python candle_research.py` (options `--index nifty|sensex`, `--interval 5m|
 3. **Uncertainty:** a 95% range for the average R per trade (bootstrap). If the range includes 0, the result could easily be luck.
 4. **Breakdown** by hour, pattern and side. For finding ideas only: small groups look good or bad by chance. Groups under 8 trades are hidden.
 5. **Extra checks:** the default rules plus one extra check at a time (volume, opening gap).
+6. **Open-interest checks:** the default rules plus each `oi_*` check, only on the days that have saved OI. It shows **no numbers until 60 trading days of OI exist** (about late February 2027; it prints how many days there are so far), because a few days would only show luck. A check counts as useful only if it also passes the strategy-lab gate (section 7d).
 
 **Result on the first full year (248 trading days, 24 Nov 2025 to 23 Nov 2026, VWAP on):**
 
@@ -598,7 +605,7 @@ ANGEL_TOTP_SECRET=
 ## 12. Plan
 
 1. **Round 1 (done):** filters, backtest, journal. Run the backtest, then watch the journal.
-2. **Round 2 (mostly done):** Angel One live data, a year of saved candles, real option prices and futures volume are in. Option-chain OI is saved daily (section 3b) and shown in the dashboard as facts, but not used in any rule. Still to do: test it as a filter once a few months of history exist, and build a longer futures volume history.
+2. **Round 2 (mostly done):** Angel One live data, a year of saved candles, real option prices and futures volume are in. Option-chain OI is saved daily (section 3b) and shown in the dashboard as facts, but not used in any rule. The `oi_*` checks and their research section are built but off; still to do: judge them once 60 trading days of OI exist (about late February 2027), and build a longer futures volume history.
    - **Round 2b (tested, none passed):** other strategy types were tested on the year of data (section 7d: 0 of 16 passed). A strategy goes live only if it is positive in at least 3 of 4 walk-forward blocks, beats the random baseline, and its 95% range after costs is above zero. Then: one quality score to rank ideas, and risk limits (daily loss limit, position sizing).
 3. **Round 3:** Claude explanation layer (explains the idea in simple words, does not calculate prices), then tune rules using backtest and journal results.
 4. Only after a good backtest AND a good journal: think about small real trades. Auto-orders last.

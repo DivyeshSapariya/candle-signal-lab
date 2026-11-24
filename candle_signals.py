@@ -46,6 +46,8 @@ OPENING_RANGE_MIN = 30
 ADX_PERIOD = 14
 VOLUME_AVG_CANDLES = 20
 VOLUME_MIN_RATIO = 1.0     # signal candle volume vs the recent average
+OI_PCR_SPLIT = 1.0          # put/call OI ratio: above = more puts written (supports CE), below supports PE
+OI_WALL_ATR = 1.0          # "just under / over a wall" = within 1 x ATR
 GAP_BIG_PCT = 0.3          # an opening gap bigger than this (in %) counts as a "big gap"
 ADX_MIN = 20
 MIN_SCORE = 3
@@ -73,6 +75,10 @@ DEFAULT_FILTERS = {
     "vwap": True,
     "volume": False,
     "gap": False,
+    # open-interest checks (research only: need saved option-chain history, see candle_research.py section 6)
+    "oi_pcr": False,
+    "oi_wall": False,
+    "oi_flow": False,
 }
 
 FILTER_LABELS = {
@@ -87,6 +93,9 @@ FILTER_LABELS = {
     "vwap": "Price on the right side of VWAP",
     "volume": "Volume above its recent average",
     "gap": "Not trading against a big opening gap",
+    "oi_pcr": "Put/call open-interest ratio agrees",
+    "oi_wall": "Not right under a call wall / over a put wall",
+    "oi_flow": "Recent open-interest build-up agrees",
 }
 
 
@@ -239,10 +248,11 @@ def add_vwap_volume_gap(f: pd.DataFrame, fut: pd.DataFrame = None) -> pd.DataFra
 
 
 def compute_features(df: pd.DataFrame, index: str, interval_min: int, vix_daily=None,
-                     fut: pd.DataFrame = None) -> pd.DataFrame:
+                     fut: pd.DataFrame = None, chain: pd.DataFrame = None) -> pd.DataFrame:
     """
     Everything the engine needs for every candle. Input: finished candles only.
     fut = candles of the index future (same candle size) used only for its volume.
+    chain = saved option-chain table (candle_store.load_option_chain) used only for the optional oi_* checks.
     """
     f = add_patterns(df)
     f = add_indicators(f)
@@ -252,6 +262,8 @@ def compute_features(df: pd.DataFrame, index: str, interval_min: int, vix_daily=
     f = add_levels(f)
     f = add_vwap_volume_gap(f, fut)
     f = add_vix(f, vix_daily)
+    from candle_chain import oi_features            # imported here: candle_chain does not need this module
+    f = f.join(oi_features(chain, f.index, interval_min))
 
     f["day"] = f.index.date
     f["start_min"] = f.index.hour * 60 + f.index.minute
@@ -422,6 +434,32 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
             "text": f"Opening gap {C['gap_pct']:+.2f}% - "
                     + (f"this trade goes against a big gap" if against else "no big gap against this trade"),
             "ok": not against, "required": True})
+
+    # --- open-interest checks (off by default; skipped when there is no OI for this candle) ---
+    if flt["oi_pcr"] and pd.notna(C["oi_pcr"]):
+        ok = bool(C["oi_pcr"] >= OI_PCR_SPLIT) if side == "CE" else bool(C["oi_pcr"] <= OI_PCR_SPLIT)
+        reasons.append({
+            "key": "oi_pcr",
+            "text": f"Put/call OI ratio {C['oi_pcr']:.2f} - " + ("agrees" if ok else "does not agree"),
+            "ok": ok, "required": True})
+    if flt["oi_wall"] and pd.notna(C["oi_call_wall"]) and pd.notna(C["oi_put_wall"]):
+        if side == "CE":
+            gap_to = C["oi_call_wall"] - C["close"]                       # call wall above = a ceiling
+            blocked, name = 0 <= gap_to <= OI_WALL_ATR * atr, f"call wall {C['oi_call_wall']:,.0f}"
+        else:
+            gap_to = C["close"] - C["oi_put_wall"]                        # put wall below = a floor
+            blocked, name = 0 <= gap_to <= OI_WALL_ATR * atr, f"put wall {C['oi_put_wall']:,.0f}"
+        reasons.append({
+            "key": "oi_wall",
+            "text": (f"Price is right at the {name}" if blocked else f"Not right at the {name}"),
+            "ok": not blocked, "required": True})
+    if flt["oi_flow"] and pd.notna(C["oi_flow"]):
+        ok = bool(C["oi_flow"] >= 0) if side == "CE" else bool(C["oi_flow"] <= 0)
+        reasons.append({
+            "key": "oi_flow",
+            "text": f"Put-minus-call OI build-up {C['oi_flow'] * 100:+.1f}% in 30 min - "
+                    + ("agrees" if ok else "does not agree"),
+            "ok": ok, "required": True})
 
     # --- points: short-term trend and key level ---
     ema_ok = bool(C["ema9"] > C["ema21"]) if side == "CE" else bool(C["ema9"] < C["ema21"])

@@ -8,6 +8,7 @@ session, and where the index stands between them.
 It only EXPLAINS. No trade rule uses it (it is tested as a possible filter later, section 3b of the README).
 """
 
+import numpy as np
 import pandas as pd
 
 LOOKAROUND = "Facts only. Not used in the trade decision."
@@ -109,3 +110,64 @@ def summarize(current: dict, previous: dict, spot: float, expiry: str, source: s
     return {"expiry": expiry, "source": source, "as_of": as_of, "spot": spot, "pcr": pcr,
             "calls": calls, "puts": puts, "calls_chg_pct": calls_chg, "puts_chg_pct": puts_chg,
             "call_wall": call_wall, "put_wall": put_wall, "rows": rows, "facts": facts}
+
+
+# ---------------------------------------------------------------------------
+# Open-interest FEATURES per candle (for research; used by the optional oi_* checks)
+# ---------------------------------------------------------------------------
+OI_FLOW_LOOKBACK_BARS = 6        # 6 five-minute bars = 30 minutes
+OI_MIN_STRIKES = 6               # fewer strikes on a side at one moment = not reliable, leave empty
+OI_TOLERANCE = pd.Timedelta(minutes=20)
+OI_COLUMNS = ["oi_pcr", "oi_call_wall", "oi_put_wall", "oi_flow"]
+
+
+def _bar_features(chain: pd.DataFrame) -> pd.DataFrame:
+    """One row per saved 5-minute bar: put/call ratio, the two walls, and the put-minus-call OI build-up."""
+    empty = pd.DataFrame(columns=OI_COLUMNS, index=pd.DatetimeIndex([], tz=chain.index.tz))
+    d = chain.dropna(subset=["oi"])
+    if d.empty:
+        return empty
+    d = d[d["expiry"] == d.groupby(d.index.date)["expiry"].transform("min")]     # nearest expiry of each day
+    wide = d.pivot_table(index=d.index, columns=["strike", "side"], values="oi", aggfunc="last").sort_index()
+    ce, pe = wide.xs("CE", level="side", axis=1), wide.xs("PE", level="side", axis=1)
+    n_ce, n_pe = ce.notna().sum(axis=1), pe.notna().sum(axis=1)
+    good = (n_ce >= OI_MIN_STRIKES) & (n_pe >= OI_MIN_STRIKES) & (n_ce == n_pe)
+
+    out = pd.DataFrame(index=wide.index, columns=OI_COLUMNS, dtype=float)
+    out["oi_pcr"] = (pe.sum(axis=1) / ce.sum(axis=1).replace(0, np.nan)).where(good)
+    out["oi_call_wall"] = ce.fillna(-1).idxmax(axis=1).astype(float).where(good)
+    out["oi_put_wall"] = pe.fillna(-1).idxmax(axis=1).astype(float).where(good)
+
+    # build-up over the last 30 minutes, on the contracts present at both moments, same day only
+    k = OI_FLOW_LOOKBACK_BARS
+    same = pd.Series(wide.index.date, index=wide.index) == pd.Series(wide.index.date, index=wide.index).shift(k)
+    gap = (pd.Series(wide.index, index=wide.index) - pd.Series(wide.index, index=wide.index).shift(k)) == pd.Timedelta(minutes=5 * k)
+    ok = same & gap & good
+    d_ce, d_pe = ce - ce.shift(k), pe - pe.shift(k)
+    base = (ce.shift(k).where(d_ce.notna()).sum(axis=1) + pe.shift(k).where(d_pe.notna()).sum(axis=1)).replace(0, np.nan)
+    out["oi_flow"] = ((d_pe.sum(axis=1) - d_ce.sum(axis=1)) / base).where(ok)
+    return out
+
+
+def oi_features(chain: pd.DataFrame, candle_index: pd.DatetimeIndex, interval_min: int) -> pd.DataFrame:
+    """
+    The OI features known when each candle has CLOSED, aligned to `candle_index` (candle START times).
+    A saved 5-minute OI bar labelled t is complete at t + 5 minutes, so a candle that starts at s and
+    closes at s + interval can use bars up to s + interval - 5. Candles without a recent bar are empty (NaN).
+    oi_pcr   : put OI / call OI.   oi_call_wall / oi_put_wall : strike with the most call / put OI.
+    oi_flow  : (put OI build-up - call OI build-up over 30 min) / OI 30 min ago. Positive = more puts written
+               than calls (often read as bullish).
+    """
+    if chain is None or len(chain) == 0:
+        return pd.DataFrame(np.nan, index=candle_index, columns=OI_COLUMNS)
+    bars = _bar_features(chain)
+    if bars.empty:
+        return pd.DataFrame(np.nan, index=candle_index, columns=OI_COLUMNS)
+    key = candle_index + pd.Timedelta(minutes=interval_min - 5)
+    out = bars.reindex(bars.index.union(key)).sort_index().ffill(limit=None)       # latest bar at or before the key
+    seen = pd.Series(bars.index, index=bars.index).reindex(out.index).ffill()
+    fresh = (out.index.to_series() - seen) <= OI_TOLERANCE
+    out.loc[~fresh.values, :] = np.nan
+    out = out.reindex(key)
+    out.index = candle_index
+    return out[OI_COLUMNS]
