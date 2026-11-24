@@ -22,7 +22,7 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `candle_journal.py` | Idea history: saves every idea, checks later how it ended (success / failed), writes the story and saves a chart. |
 | `candle_memory.py` | The tool's memory: remembers how every finished idea ended, recalls similar past ideas, writes lessons. |
 | `live_monitor.py` | Text-only live watcher (simple version). |
-| `candle_store.py` | Your own candle database. Saves NIFTY / SENSEX candles and India VIX into `market_data.db`. Can also download a year of history and the futures volume from Angel One (see section 3b). |
+| `candle_store.py` | Your own candle database. Saves NIFTY / SENSEX candles and India VIX into `market_data.db`. Can also download a year of history, the futures volume and the option chain (open interest) from Angel One (see section 3b). |
 | `candle_analysis.py` | Explains the decision for the dashboard: the 4-step "Live analysis" card and the list of recent setups that were dropped, and why (section 3). It adds no rules. |
 | `candle_research.py` | Honest checks on your saved candles: walk-forward blocks, cost stress, uncertainty range, breakdowns, extra checks (section 7c). |
 | `strategy_lab.py` | Tests other strategy types (opening-range breakout, VWAP pullback, trend continuation, mean reversion) on your saved candles against a strict pass/fail gate (section 7d). Changes no live rules. |
@@ -31,6 +31,7 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `test_candle_analysis.py` | Checks that the Live analysis card always agrees with the real decision. |
 | `test_candle_research.py` | Checks the research maths, and the VWAP / volume / gap features (no look-ahead). |
 | `test_strategy_lab.py` | Checks the strategy lab: no look-ahead, same simulator and costs as the main backtest, and that random data fails the gate. |
+| `test_option_chain.py` | Checks the option-chain saving with a fake Angel One (nearest expiry, strikes, no duplicates, no running candle). |
 | `test_candle_backfill.py` | Checks the Angel One downloader and the rate-limit handling with a fake Angel One (no login, no internet). |
 | `telegram_notify.py` | Sends a short Telegram message when a new idea appears and when it ends (see section 3c). Also has the setup helpers `--check`, `--test` and `--find-chat`. |
 | `test_telegram_notify.py` | Tests the Telegram alerts with a fake Telegram, so no real bot is needed. |
@@ -75,6 +76,7 @@ Tip: you do not have to activate the environment. You can also run any command w
 | Save today's candles to your database | `python candle_store.py collect` |
 | Download a year of history from Angel One | `python candle_store.py backfill --days 365` |
 | Save futures candles (real volume) from Angel One | `python candle_store.py backfill-futures` |
+| Save option-chain data (open interest, volume, price) from Angel One | `python candle_store.py backfill-options` |
 | See what the database holds | `python candle_store.py status` |
 | Does the strategy beat random entries? | `python candle_baseline.py` |
 | Walk-forward, cost stress, uncertainty and extra checks on your saved data | `python candle_research.py` |
@@ -82,7 +84,7 @@ Tip: you do not have to activate the environment. You can also run any command w
 | Check that the rules never use the future | `python test_no_lookahead.py` |
 | Telegram: check the settings / send a test message / find the group id | `python telegram_notify.py --check` / `--test` / `--find-chat` |
 | Test the Telegram alerts (no real bot needed) | `python test_telegram_notify.py` |
-| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_strategy_lab.py` |
+| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_strategy_lab.py` |
 
 Stop any of them with **Ctrl + C**.
 
@@ -138,6 +140,7 @@ Yahoo only gives about 60 days of 5-minute candles and 7 days of 1-minute candle
 | Export to a CSV file | `python candle_store.py export --index nifty --interval 5m --out nifty_5m.csv` |
 | Download up to a year of 5m and 15m candles from Angel One | `python candle_store.py backfill --days 365` (options `--index`, `--interval`) |
 | Save futures candles with real volume from Angel One | `python candle_store.py backfill-futures` |
+| Save option-chain data (open interest) from Angel One | `python candle_store.py backfill-options` (options `--days`, `--strikes`, `--index`) |
 
 Use the saved history in your own code (same format as the live candles):
 
@@ -147,7 +150,7 @@ df = load_candles("nifty", "5m")
 vix = load_vix()
 ```
 
-**Daily schedule:** a Windows scheduled task named `AI-Trading-Candle-Collect` runs every Monday to Friday at 4:00 pm (after the market closes). It has two steps, one after the other: `candle_store.py collect` (Yahoo candles and India VIX) and `candle_store.py backfill-futures --days 5` (the futures volume, needs the Angel One values in `.env`). If one step fails, the other still runs. If the PC was off at that time, it runs when the PC is next on and you are logged in. Run `collect` yourself at least once a week; if the PC is off for more than 7 days, those 1-minute candles are lost for good. To remove the task: `Unregister-ScheduledTask -TaskName "AI-Trading-Candle-Collect" -Confirm:$false` (PowerShell).
+**Daily schedule:** a Windows scheduled task named `AI-Trading-Candle-Collect` runs every Monday to Friday at 4:00 pm (after the market closes). It has three steps, one after the other: `candle_store.py collect` (Yahoo candles and India VIX), `candle_store.py backfill-futures --days 5` (the futures volume) and `candle_store.py backfill-options --days 5` (the option chain, about 3 minutes); the last two need the Angel One values in `.env`. If one step fails, the other still runs. If the PC was off at that time, it runs when the PC is next on and you are logged in. Run `collect` yourself at least once a week; if the PC is off for more than 7 days, those 1-minute candles are lost for good. To remove the task: `Unregister-ScheduledTask -TaskName "AI-Trading-Candle-Collect" -Confirm:$false` (PowerShell).
 
 The backtest still downloads from Yahoo by default. To test on your saved history, load it with `load_candles` and pass it to `compute_features` and `run_backtest`, or export a CSV and use `candle_backtest.py --csv`. `candle_baseline.py` and `candle_research.py` already read the saved history.
 
@@ -166,6 +169,16 @@ The indexes themselves have no volume, so volume and a real VWAP come from the i
 - `python candle_store.py backfill-futures` saves them as `NIFTY_FUT` and `SENSEX_FUT`. Each contract is saved only for the time it was the **nearest** one (from the day after the previous monthly expiry until its own expiry), because far-month contracts have very little volume and would give misleading numbers.
 - **Expired contracts cannot be downloaded.** So futures volume history cannot go back a year: it starts from the oldest contract that is still listed (about 17 days of SENSEX at the first run; NIFTY starts when its December contract became the nearest one). It then grows by itself through the daily schedule above. If you do not use the schedule, run `backfill-futures` at least once a month, before the contract expires, or that month's volume is lost for good.
 - The dashboard also fetches the nearest future live (cached for a minute) when the data source is Angel One, so VWAP and volume are real there.
+
+### Option chain (`backfill-options`)
+
+Saves what other traders are holding: for the **nearest expiry**, the at-the-money strike plus 5 strikes each side (calls and puts, 22 contracts per index), the 5-minute price, volume and **open interest (OI)**. They go into the `option_oi` table in `market_data.db`. Read-only, no orders.
+
+- The current index level comes from your saved 5m candles, so run `collect` first on a new database.
+- Safe to repeat: running it again updates rows, never duplicates them. The running candle is never saved, and one failing contract does not stop the others. A contract that expires today is still saved after the close.
+- **Expired contracts cannot be downloaded**, so OI history cannot go back in time: it grows by one trading day per day through the daily schedule (the first run saved 19 to 23 Nov 2026). The strikes saved follow the index level on the day it is run.
+- Read it in your own code with `load_option_chain("nifty")` (columns: expiry, strike, side, close, volume, oi).
+- **Not used yet:** no rule or dashboard card uses OI. The plan is to show it as plain facts first (put/call ratio, strikes with the most OI), and to test it as a filter with `candle_research.py` and `strategy_lab.py` only after a few months of history exist.
 
 ---
 
@@ -569,6 +582,7 @@ ANGEL_TOTP_SECRET=
 
 - The rules and tests were first checked offline with fake candles. Angel One was tested with a real account outside market hours; a full live market session on Angel One data (including alerts) still needs to be watched.
 - Yahoo gives only about 60 days of 5-minute candles. With Angel One you can save a year (section 3b); the one-year result is in section 7c and shows no proven edge.
+- Option-chain (OI) history is short too: it starts on 19 Nov 2026 and only grows daily; it covers only the nearest expiry and the strikes around the index level of each day.
 - Futures volume history is short: expired contracts cannot be downloaded, so it only grows from when it was first saved. The index candles themselves have no volume, so in the long backtests VWAP is the plain average price for most days.
 - With Yahoo, option prices are **estimates** (live option prices come only from Angel One). A real exit can also be worse than the stop price if the market moves very fast.
 - Market holidays are only partly handled: the `HOLIDAYS` list in `option_pricer.py` (used for expiry dates, and now also to show "Market closed") has only 24 Nov 2026 and 25 Dec 2026. Add the other NSE / BSE holidays yourself.
@@ -581,7 +595,7 @@ ANGEL_TOTP_SECRET=
 ## 12. Plan
 
 1. **Round 1 (done):** filters, backtest, journal. Run the backtest, then watch the journal.
-2. **Round 2 (mostly done):** Angel One live data, a year of saved candles, real option prices and futures volume are in. Still to do: option chain (open interest) and a longer futures volume history.
+2. **Round 2 (mostly done):** Angel One live data, a year of saved candles, real option prices and futures volume are in. Option-chain OI is now being saved daily (section 3b) but not used yet. Still to do: show OI in the dashboard as facts, then test it as a filter once a few months of history exist, and build a longer futures volume history.
    - **Round 2b (tested, none passed):** other strategy types were tested on the year of data (section 7d: 0 of 16 passed). A strategy goes live only if it is positive in at least 3 of 4 walk-forward blocks, beats the random baseline, and its 95% range after costs is above zero. Then: one quality score to rank ideas, and risk limits (daily loss limit, position sizing).
 3. **Round 3:** Claude explanation layer (explains the idea in simple words, does not calculate prices), then tune rules using backtest and journal results.
 4. Only after a good backtest AND a good journal: think about small real trades. Auto-orders last.

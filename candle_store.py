@@ -26,6 +26,10 @@ Futures volume (real volume for VWAP; the index itself has none):
     python candle_store.py backfill-futures                    # saved as NIFTY_FUT / SENSEX_FUT
 Expired contracts cannot be downloaded, so run this at least once a month (before the expiry).
 
+Option chain (open interest, volume and price of the nearest-expiry options around the index level):
+    python candle_store.py backfill-options                    # saved in the option_oi table
+Expired contracts cannot be downloaded, so run this every trading day (it is in the daily schedule).
+
 Longer history from Angel One (needs the ANGEL_* values in .env, read-only, no orders):
     python candle_store.py backfill --days 365                 # NIFTY + SENSEX, 5m and 15m
     python candle_store.py backfill --days 365 --index nifty --interval 5m
@@ -55,6 +59,15 @@ CREATE TABLE IF NOT EXISTS candles (
     ts       INTEGER NOT NULL,      -- candle START time, seconds since 1970 (UTC)
     open REAL, high REAL, low REAL, close REAL, volume REAL,
     PRIMARY KEY (idx, interval, ts)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS option_oi (
+    idx      TEXT    NOT NULL,      -- nifty / sensex
+    expiry   TEXT    NOT NULL,      -- YYYY-MM-DD
+    strike   REAL    NOT NULL,
+    side     TEXT    NOT NULL,      -- CE / PE
+    ts       INTEGER NOT NULL,      -- 5-minute candle START time, seconds since 1970 (UTC)
+    close REAL, volume REAL, oi REAL,
+    PRIMARY KEY (idx, expiry, strike, side, ts)
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS vix_daily (
     day   TEXT PRIMARY KEY,         -- YYYY-MM-DD
@@ -200,6 +213,70 @@ def load_futures(index: str, interval: str, path: str = DB_FILE) -> pd.DataFrame
     return load_candles(f"{index}_fut", interval, path)
 
 
+def backfill_option_chain(con, index: str, days: int = 5, strikes: int = 5, spot: float = None,
+                          now: datetime = None, log=print, contracts=None, fetch=None) -> str:
+    """
+    Save 5-minute price, volume and OPEN INTEREST of the nearest-expiry option contracts around the
+    current index level (ATM +/- `strikes` steps, calls and puts) into the option_oi table.
+    Only for contracts that are still listed (expired contracts cannot be downloaded), so run it daily.
+    Read-only, no orders. One failing contract does not stop the others.
+    """
+    from data_sources import angel_option_contracts, fetch_angel_option_history
+
+    now = now or datetime.now(IST)
+    if contracts is None:
+        if spot is None:
+            row = con.execute("SELECT close FROM candles WHERE idx=? AND interval='5m' ORDER BY ts DESC LIMIT 1",
+                              (index,)).fetchone()
+            if row is None:
+                return "no index candles saved yet, so the current level is unknown (run collect first)"
+            spot = row[0]
+        contracts = angel_option_contracts(index, spot, strikes, now)
+    if not contracts:
+        return "no option contracts found"
+    fetch = fetch or fetch_angel_option_history
+    start = now - timedelta(days=days)
+    saved, failed, last_error = 0, 0, ""
+    for c in contracts:
+        try:
+            df = fetch(c, start, now)
+        except Exception as error:
+            failed += 1
+            last_error = str(error)[:150]
+            continue
+        # the 5-minute candle that is still running is not finished: leave it out
+        df = df[[ts + timedelta(minutes=5) <= now for ts in df.index]]
+        if df.empty:
+            continue
+        rows = [(index, c["expiry"].isoformat(), float(c["strike"]), c["side"], int(ts.timestamp()),
+                 float(r["close"]), float(r["volume"] or 0), None if pd.isna(r["oi"]) else float(r["oi"]))
+                for ts, r in df.iterrows()]
+        with con:
+            con.executemany("INSERT OR REPLACE INTO option_oi VALUES (?,?,?,?,?,?,?,?)", rows)
+        saved += len(rows)
+    log(f"    {index.upper()} options {contracts[0]['expiry']:%d %b %Y}: {len(contracts)} contracts, {saved} rows")
+    note = f"ok" if not failed else f"{failed} contracts failed ({last_error})"
+    con.execute("INSERT INTO collect_log VALUES (?,?,?,?,?,?,?)",
+                (datetime.now(IST).isoformat(timespec="seconds"), index, "options", saved,
+                 start.isoformat(timespec="seconds"), now.isoformat(timespec="seconds"), f"option chain {note}"[:300]))
+    con.commit()
+    return f"{len(contracts)} contracts, saved {saved} rows ({note})"
+
+
+def load_option_chain(index: str, path: str = DB_FILE) -> pd.DataFrame:
+    """Saved option price / volume / open interest (IST time index; columns expiry, strike, side, close, volume, oi)."""
+    con = connect(path)
+    try:
+        df = pd.read_sql_query(
+            "SELECT ts, expiry, strike, side, close, volume, oi FROM option_oi WHERE idx=? "
+            "ORDER BY ts, strike, side", con, params=(index,))
+    finally:
+        con.close()
+    df.index = pd.DatetimeIndex(pd.to_datetime(df.pop("ts"), unit="s", utc=True)).tz_convert(IST)
+    df.index.name = "datetime"
+    return df
+
+
 def collect_vix(con) -> str:
     from option_pricer import get_vix_daily
     series = get_vix_daily(period="2y")
@@ -251,6 +328,12 @@ def status(con) -> None:
                            "WHERE idx=? AND interval=?", (idx, interval)).fetchone()[0]
         print(f"{idx.upper():<7}{interval:<4} {n:>7} candles, {days:>3} days  "
               f"{a:%d %b %Y %H:%M} -> {b:%d %b %Y %H:%M}")
+    o = con.execute("SELECT idx, COUNT(*), COUNT(DISTINCT date(ts + 19800, 'unixepoch')), MIN(ts), MAX(ts) "
+                    "FROM option_oi GROUP BY idx ORDER BY idx").fetchall()
+    for idx, n, days, lo, hi in o:
+        a = datetime.fromtimestamp(lo, timezone.utc).astimezone(IST)
+        b = datetime.fromtimestamp(hi, timezone.utc).astimezone(IST)
+        print(f"{idx.upper():<7}options {n:>6} rows, {days:>3} days  {a:%d %b %Y %H:%M} -> {b:%d %b %Y %H:%M}")
     v = con.execute("SELECT COUNT(*), MIN(day), MAX(day) FROM vix_daily").fetchone()
     if v[0]:
         print(f"INDIAVIX daily {v[0]:>5} days    {v[1]} -> {v[2]}")
@@ -262,10 +345,11 @@ def status(con) -> None:
 
 def main():
     p = argparse.ArgumentParser(description="Collect candles into a local SQLite database.")
-    p.add_argument("action", choices=["collect", "backfill", "backfill-futures", "status", "export"])
+    p.add_argument("action", choices=["collect", "backfill", "backfill-futures", "backfill-options", "status", "export"])
     p.add_argument("--days", type=int, default=365, help="backfill: how many days back (default 365)")
     p.add_argument("--index", choices=list(INDEXES), help="only this index (default: both)")
     p.add_argument("--interval", choices=list(INTERVAL_MINUTES), help="only this candle size (default: all)")
+    p.add_argument("--strikes", type=int, default=5, help="backfill-options: strikes each side of the current level (default 5)")
     p.add_argument("--no-vix", action="store_true", help="do not collect India VIX")
     p.add_argument("--db", default=DB_FILE)
     p.add_argument("--out", help="export: CSV file to write")
@@ -287,6 +371,14 @@ def main():
             for interval in ([args.interval] if args.interval else BACKFILL_INTERVALS):
                 print(f"{idx.upper()} futures {interval}: downloading from Angel One...")
                 print(f"  -> {backfill_futures(con, idx, interval, args.days if args.days != 365 else 120)}")
+        print()
+        status(con)
+    elif args.action == "backfill-options":
+        import telegram_notify
+        telegram_notify.load_env_file()
+        for idx in ([args.index] if args.index else INDEXES):
+            print(f"{idx.upper()} option chain: downloading from Angel One...")
+            print(f"  -> {backfill_option_chain(con, idx, args.days if args.days != 365 else 5, args.strikes)}")
         print()
         status(con)
     elif args.action == "backfill":

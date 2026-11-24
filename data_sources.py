@@ -300,6 +300,68 @@ def fetch_angel_option(index: str, strike: int, side: str) -> dict:
     return {"ltp": float(ltp), "symbol": row["symbol"], "expiry": expiry}
 
 
+def angel_option_contracts(index: str, spot: float, strikes: int = 5, now: datetime = None) -> list:
+    """
+    The option contracts of the nearest expiry whose strike is within `strikes` steps of `spot`
+    (both calls and puts). Judged from 9:00 am of today so a contract that expires TODAY is still
+    included after the close. Returns [{expiry, symbol, token, exchange, strike, side}], sorted by strike.
+    """
+    segment, name = OPTION_SEGMENT[index]
+    now = (now or datetime.now(IST)).replace(hour=9, minute=0, second=0, microsecond=0)
+    rows = []
+    for row in _load_scrip_master():
+        if (row.get("name") != name or row.get("exch_seg") != segment
+                or row.get("instrumenttype") != "OPTIDX"):
+            continue
+        symbol = str(row.get("symbol", ""))
+        if not symbol.endswith(("CE", "PE")):
+            continue
+        try:
+            expiry = datetime.strptime(row["expiry"], "%d%b%Y").date()
+            strike = float(row["strike"]) / 100.0
+        except (KeyError, ValueError):
+            continue
+        if expiry < now.date():
+            continue
+        rows.append({"expiry": expiry, "symbol": symbol, "token": row["token"], "exchange": segment,
+                     "strike": strike, "side": symbol[-2:]})
+    if not rows:
+        return []
+    nearest = min(r["expiry"] for r in rows)
+    rows = [r for r in rows if r["expiry"] == nearest]
+    levels = sorted({r["strike"] for r in rows})
+    atm = min(range(len(levels)), key=lambda i: abs(levels[i] - spot))
+    keep = set(levels[max(0, atm - strikes): atm + strikes + 1])
+    return sorted((r for r in rows if r["strike"] in keep), key=lambda r: (r["strike"], r["side"]))
+
+
+def fetch_angel_option_history(contract: dict, start: datetime, end: datetime) -> pd.DataFrame:
+    """
+    5-minute history of ONE option contract: close, volume (from the candles) and open interest
+    (from the OI history). Read-only. Returns a table with an IST time index, columns close/volume/oi.
+    """
+    client = _angel_login()
+    params = {
+        "exchange": contract["exchange"], "symboltoken": contract["token"], "interval": "FIVE_MINUTE",
+        "fromdate": start.astimezone(IST).strftime("%Y-%m-%d %H:%M"),
+        "todate": end.astimezone(IST).strftime("%Y-%m-%d %H:%M"),
+    }
+    candles = _angel_request(lambda: client.getCandleData(dict(params)))
+    oi = _angel_request(lambda: client.getOIData(dict(params)))
+    for res in (candles, oi):
+        if not (res or {}).get("status"):
+            raise RuntimeError(f"Angel One option history failed: {str(res)[:200]}")
+    c = pd.DataFrame((candles.get("data") or []), columns=["datetime", "open", "high", "low", "close", "volume"])
+    o = pd.DataFrame((oi.get("data") or []), columns=["time", "oi"]) if oi.get("data") else pd.DataFrame(columns=["time", "oi"])
+    if c.empty:
+        return pd.DataFrame(columns=["close", "volume", "oi"], index=pd.DatetimeIndex([], tz=IST, name="datetime"))
+    c["datetime"] = pd.to_datetime(c["datetime"], utc=True).dt.tz_convert(IST)
+    o["datetime"] = pd.to_datetime(o["time"], utc=True).dt.tz_convert(IST)
+    df = c.set_index("datetime")[["close", "volume"]].join(o.set_index("datetime")[["oi"]], how="left")
+    df.index.name = "datetime"
+    return df
+
+
 # ---------------------------------------------------------------------------
 # One function to use everywhere
 # ---------------------------------------------------------------------------
