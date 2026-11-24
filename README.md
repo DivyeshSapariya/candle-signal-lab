@@ -25,10 +25,12 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `candle_store.py` | Your own candle database. Saves NIFTY / SENSEX candles and India VIX into `market_data.db`. Can also download a year of history and the futures volume from Angel One (see section 3b). |
 | `candle_analysis.py` | Explains the decision for the dashboard: the 4-step "Live analysis" card and the list of recent setups that were dropped, and why (section 3). It adds no rules. |
 | `candle_research.py` | Honest checks on your saved candles: walk-forward blocks, cost stress, uncertainty range, breakdowns, extra checks (section 7c). |
+| `strategy_lab.py` | Tests other strategy types (opening-range breakout, VWAP pullback, trend continuation, mean reversion) on your saved candles against a strict pass/fail gate (section 7d). Changes no live rules. |
 | `candle_baseline.py` | Reality check: compares the strategy with random entries (same exits, costs and stop sizes) to see if it beats chance (see section 7b). |
 | `test_no_lookahead.py` | Safety test: checks that the rules never use the future. |
 | `test_candle_analysis.py` | Checks that the Live analysis card always agrees with the real decision. |
 | `test_candle_research.py` | Checks the research maths, and the VWAP / volume / gap features (no look-ahead). |
+| `test_strategy_lab.py` | Checks the strategy lab: no look-ahead, same simulator and costs as the main backtest, and that random data fails the gate. |
 | `test_candle_backfill.py` | Checks the Angel One downloader and the rate-limit handling with a fake Angel One (no login, no internet). |
 | `telegram_notify.py` | Sends a short Telegram message when a new idea appears and when it ends (see section 3c). Also has the setup helpers `--check`, `--test` and `--find-chat`. |
 | `test_telegram_notify.py` | Tests the Telegram alerts with a fake Telegram, so no real bot is needed. |
@@ -76,10 +78,11 @@ Tip: you do not have to activate the environment. You can also run any command w
 | See what the database holds | `python candle_store.py status` |
 | Does the strategy beat random entries? | `python candle_baseline.py` |
 | Walk-forward, cost stress, uncertainty and extra checks on your saved data | `python candle_research.py` |
+| Test other strategy types on your saved data (about 8 minutes) | `python strategy_lab.py` (options `--index`, `--interval`, `--strategy orb\|vwap_pull\|trend_pull\|mean_rev`, `--runs`) |
 | Check that the rules never use the future | `python test_no_lookahead.py` |
 | Telegram: check the settings / send a test message / find the group id | `python telegram_notify.py --check` / `--test` / `--find-chat` |
 | Test the Telegram alerts (no real bot needed) | `python test_telegram_notify.py` |
-| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py` |
+| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_strategy_lab.py` |
 
 Stop any of them with **Ctrl + C**.
 
@@ -412,6 +415,33 @@ Run `python candle_research.py` (options `--index nifty|sensex`, `--interval 5m|
 
 ---
 
+## 7d. Other strategy types (`strategy_lab.py`)
+
+Run `python strategy_lab.py` (about 8 minutes; options `--index`, `--interval`, `--strategy`, `--runs`). It reads `market_data.db`, writes nothing and changes no live rules. Four fixed strategies were written down before testing and not tuned afterwards:
+
+| Strategy | Idea |
+|---|---|
+| `orb` | Opening-range breakout: trade the break of the first range of the day. |
+| `vwap_pull` | In a trend, buy the pullback to VWAP (sell the bounce for a down-trend). |
+| `trend_pull` | Trend continuation after a pullback. |
+| `mean_rev` | Quiet days only (ADX below 20): fade moves away from the day's average, 1:1 reward. |
+
+They use the same trade simulation, 0.10 R cost and trading hours as the main backtest, and never look at later candles. A strategy **passes the gate** only if all of these hold: at least 60 trades, average R above 0 after costs, positive in at least 3 of 4 time blocks, a 95% range above zero, and better than random entries at p below 0.01 (strict, because many tests make lucky wins likely).
+
+**Result on the first full year (16 tests, average R per trade after 0.1 R cost): 0 passed the gate.**
+
+| Strategy | NIFTY 5m | NIFTY 15m | SENSEX 5m | SENSEX 15m |
+|---|---|---|---|---|
+| Opening-range breakout | -0.11 | -0.05 | -0.19 | -0.04 |
+| VWAP pullback | -0.02 | +0.06 | -0.04 | -0.04 |
+| Trend continuation | -0.04 | -0.05 | -0.10 | -0.05 |
+| Mean reversion | -0.19 | -0.11 | -0.21 | -0.21 |
+| Current rules (for comparison) | -0.12 | -0.02 | -0.05 | +0.07 |
+
+The closest was the VWAP pullback on NIFTY 15m (+0.06 R, 3 of 4 blocks positive, beat random at p = 0.003), but its 95% range (-0.09 to +0.21) includes zero and it turns negative at a 0.2 R cost. With 16 tests, one lucky-looking result is expected. Limits: VWAP is the plain average price for most days (futures volume is short), only one fixed version of each strategy was tested, and one year is short. Re-run it as futures volume and history grow.
+
+---
+
 ## 8. Idea history (success or failed)
 
 The "Trade idea" card clears when the next candle comes. The idea is NOT lost. Every idea is saved automatically in **Idea history** (the section below the chart) with:
@@ -552,7 +582,7 @@ ANGEL_TOTP_SECRET=
 
 1. **Round 1 (done):** filters, backtest, journal. Run the backtest, then watch the journal.
 2. **Round 2 (mostly done):** Angel One live data, a year of saved candles, real option prices and futures volume are in. Still to do: option chain (open interest) and a longer futures volume history.
-   - **Round 2b (next):** test other strategy types on the year of data (opening-range breakout, VWAP pullback, trend continuation, mean reversion). A strategy goes live only if it is positive in at least 3 of 4 walk-forward blocks, beats the random baseline, and its 95% range after costs is above zero. Then: one quality score to rank ideas, and risk limits (daily loss limit, position sizing).
+   - **Round 2b (tested, none passed):** other strategy types were tested on the year of data (section 7d: 0 of 16 passed). A strategy goes live only if it is positive in at least 3 of 4 walk-forward blocks, beats the random baseline, and its 95% range after costs is above zero. Then: one quality score to rank ideas, and risk limits (daily loss limit, position sizing).
 3. **Round 3:** Claude explanation layer (explains the idea in simple words, does not calculate prices), then tune rules using backtest and journal results.
 4. Only after a good backtest AND a good journal: think about small real trades. Auto-orders last.
 
