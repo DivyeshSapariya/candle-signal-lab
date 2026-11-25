@@ -386,6 +386,8 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         """
         if not tg.is_configured() or not market_open:
             return False
+        if not _alert_allowed(index, interval):
+            return False                                 # looking at another market in the page never sends an alert
         if plan["signal"] == "NONE" or plan.get("decision_time") != idea.get("decision_time"):
             return False
         return (not delayed) or tg.allow_delayed()
@@ -652,6 +654,11 @@ def _candle_already_seen(cached, interval_min: int, now: datetime) -> bool:
         return False                                                           # built before this candle closed
     expected = (boundary - timedelta(minutes=interval_min)).strftime("%d %b %H:%M")
     return (payload.get("latest") or {}).get("time") == expected
+
+
+def _alert_allowed(index: str, interval: str) -> bool:
+    """New-idea alerts are sent only for the markets you chose (ALERT_MARKETS, default nifty:5m,sensex:5m)."""
+    return (index, interval) in _alert_markets()
 
 
 def _alert_tick(source: str = None, markets: list = None) -> int:

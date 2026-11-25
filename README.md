@@ -43,6 +43,7 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `session_check.py` | A read-only end-of-day check: trading day, fresh data, the day's ideas and alerts, what was saved, your settings. It runs by itself after the 16:00 collection and sends you a summary (section 3d). |
 | `test_holidays.py`, `test_risk_limits.py`, `test_session_check.py` | Tests for the three items above. |
 | `test_speed.py` | Checks the first-load speed-ups with fake Angel One calls: page requests go first, slow refreshes never block the page, Refresh waits for fresh numbers, the alert loop looks once per candle. |
+| `test_alert_markets.py` | Checks that new-idea alerts go only to the markets in `ALERT_MARKETS`, and that other markets are saved without an alert (and so get no result alert). |
 | `test_waiting_ideas.py` | Checks that waiting ideas of markets nobody is looking at are settled once per candle, with one result alert and no new ideas. |
 | `test_late_trade.py` | Checks that a late-day trade is closed at the day's last candle even without a 15:25 candle, and that a running session stays open. |
 | `.env.example` | Template for your private settings (Telegram, Angel One, optional risk limits). Copy it to `.env` and fill in your values (sections 3c and 9). |
@@ -96,7 +97,7 @@ Tip: you do not have to activate the environment. You can also run any command w
 | Test the Telegram alerts (no real bot needed) | `python test_telegram_notify.py` |
 | End-of-day check (runs by itself after 16:00; by hand if you want) | `python session_check.py` (options `--date YYYY-MM-DD`, `--no-live`, `--auto`, `--force`) |
 | Test smaller targets on the current rules' entries (section 7e) | `python strategy_lab.py --short-targets` (options `--index`, `--interval`, `--variant r0.5\|r1.0\|rs10\|rs20\|pct30\|pct50`, `--runs`) |
-| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_candle_chain.py`, `python test_oi_filters.py`, `python test_strategy_lab.py`, `python test_holidays.py`, `python test_risk_limits.py`, `python test_session_check.py`, `python test_late_trade.py`, `python test_speed.py`, `python test_waiting_ideas.py` |
+| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_candle_chain.py`, `python test_oi_filters.py`, `python test_strategy_lab.py`, `python test_holidays.py`, `python test_risk_limits.py`, `python test_session_check.py`, `python test_late_trade.py`, `python test_speed.py`, `python test_waiting_ideas.py`, `python test_alert_markets.py` |
 
 Stop any of them with **Ctrl + C**.
 
@@ -267,6 +268,7 @@ How to read them:
 
 ### When an alert is sent
 
+- Only for the markets in `ALERT_MARKETS` (default NIFTY and SENSEX 5 minute). Looking at another market or candle size in the page never sends an alert; its ideas are saved in the history only.
 - Only for the idea that is on the screen **right now**, while the market is open. An idea found after the fact (it appeared while nobody was looking) is saved in the history but not sent, because it would be stale.
 - **Free Yahoo data is always about 15 minutes late.** Alerts are sent anyway, and each one starts with a `DELAYED DATA: about N min old` line, because the entry moment may already have passed. To send nothing on old data, set `TELEGRAM_ALLOW_DELAYED=0`. Or use Angel One for live data.
 - **Each alert is sent exactly once**, also after a restart or an auto-reload (the journal remembers it in its `alerts` column). The result message is only sent for ideas that were alerted.
@@ -299,7 +301,7 @@ Put them in `.env` or set them in the terminal (a value set in the terminal wins
 | `TELEGRAM_BOT_TOKEN` | Required. From @BotFather. Anyone who has it can send messages as your bot. |
 | `TELEGRAM_CHAT_ID` | Required. The group or chat that receives the messages. |
 | `TELEGRAM_ALLOW_DELAYED` | Alerts are also sent when the data is old (free Yahoo always is); the message then starts with a `DELAYED DATA` line. Set it to `0` to send nothing on old data. Default: alerts are sent. |
-| `ALERT_MARKETS` | The markets the loop watches. Default `nifty:5m,sensex:5m`. |
+| `ALERT_MARKETS` | The markets that send **new-idea alerts**, and that the loop watches. Default `nifty:5m,sensex:5m`. An idea found in any other market or candle size (for example while you look at 15 minutes in the page) is still saved in the history, but no alert is sent for it. |
 | `ALERT_SOURCE` | `yahoo` or `angel`. Default: `angel` when the four `ANGEL_*` values are in `.env`, otherwise `yahoo`. |
 
 ### Cautions
