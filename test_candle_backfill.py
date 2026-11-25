@@ -92,6 +92,31 @@ def main():
         for c in (con, con2, con3):
             c.close()
 
+    # 4b) futures: saved under <index>_fut, only for the time each contract was the nearest one
+    from datetime import date
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        con4 = candle_store.connect(os.path.join(folder, "f.db"))
+        windows = []
+
+        def fut_fetch(key, interval, start, end, allow_empty=False):
+            windows.append((start, end))
+            return fake_candles(start, end)
+
+        contracts = [{"expiry": date(2026, 11, 26), "symbol": "SENSEX26NOVFUT", "token": "1", "exchange": "BFO"},
+                     {"expiry": date(2026, 12, 31), "symbol": "SENSEX26DECFUT", "token": "2", "exchange": "BFO"}]
+        note = candle_store.backfill_futures(con4, "sensex", "5m", days=120,
+                                             contracts=contracts, now=datetime(2026, 11, 23, 16, 0, tzinfo=IST),
+                                             log=lambda *a, **k: None, fetch=fut_fetch)
+        first = min(w[0] for w in windows)
+        assert first == datetime(2026, 10, 30, tzinfo=IST), first          # day after the Oct 29 expiry
+        assert all(w[1] <= datetime(2026, 11, 23, 16, 0, tzinfo=IST) for w in windows)
+        keys = {r[0] for r in con4.execute("SELECT DISTINCT idx FROM candles")}
+        assert keys == {"sensex_fut"}, keys
+        assert "SENSEX26NOVFUT" in note and "SENSEX26DECFUT" not in note, note   # Dec is not nearest yet
+        assert len(candle_store.load_futures("sensex", "5m", os.path.join(folder, "f.db"))) > 0
+        con4.close()
+    print("OK: futures saved as <index>_fut, only while each contract was the nearest")
+
     # 5) rate-limit retry in data_sources: waits, then succeeds; other errors are not retried
     slept = []
     import time as _time
@@ -135,5 +160,35 @@ def main():
     print("OK: 'too fast' answers are retried after a wait, other errors are not hidden")
 
 
+def test_one_at_a_time():
+    """Many dashboard requests at once must reach Angel One one by one, with a pause between them."""
+    import threading
+    import time
+
+    old_gap = ds.ANGEL_CALL_GAP_SECONDS
+    ds.ANGEL_CALL_GAP_SECONDS = 0.05
+    stamps, running, overlap = [], [0], []
+
+    def call():
+        running[0] += 1
+        overlap.append(running[0])
+        stamps.append(time.time())
+        time.sleep(0.01)
+        running[0] -= 1
+        return {"status": True, "data": []}
+
+    try:
+        threads = [threading.Thread(target=lambda: ds._angel_request(call)) for _ in range(8)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+    finally:
+        ds.ANGEL_CALL_GAP_SECONDS = old_gap
+    assert max(overlap) == 1, "two requests reached Angel One at the same time"
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    assert len(stamps) == 8 and min(gaps) >= 0.045, f"requests too close together: {min(gaps):.3f}s"
+    print("OK: 8 simultaneous requests are sent one at a time with a pause between them")
+
+
 if __name__ == "__main__":
+    test_one_at_a_time()
     main()

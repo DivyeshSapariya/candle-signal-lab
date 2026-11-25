@@ -19,12 +19,12 @@ from datetime import datetime
 
 from candle_patterns import add_patterns, latest_candle_report
 from data_sources import IST, INTERVAL_MINUTES, get_candles
-from option_pricer import HOLIDAYS
+from option_pricer import is_holiday
 
 
 def market_is_open(now: datetime) -> bool:
-    """NSE / BSE: Monday to Friday, 9:15 to 15:30 IST, except exchange holidays (option_pricer.HOLIDAYS)."""
-    if now.weekday() >= 5 or now.date() in HOLIDAYS:
+    """NSE / BSE: Monday to Friday, 9:15 to 15:30 IST, except exchange holidays (holidays.csv)."""
+    if now.weekday() >= 5 or is_holiday(now.date()):
         return False
     minutes = now.hour * 60 + now.minute
     return 9 * 60 + 15 <= minutes <= 15 * 60 + 30

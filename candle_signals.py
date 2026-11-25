@@ -46,6 +46,9 @@ OPENING_RANGE_MIN = 30
 ADX_PERIOD = 14
 VOLUME_AVG_CANDLES = 20
 VOLUME_MIN_RATIO = 1.0     # signal candle volume vs the recent average
+OI_PCR_SPLIT = 1.0          # put/call OI ratio: above = more puts written (supports CE), below supports PE
+OI_WALL_ATR = 1.0          # "just under / over a wall" = within 1 x ATR
+ROOM_MIN_R = 2.0           # "room" check: the nearest key level ahead must be at least this far (in R) = the target distance
 GAP_BIG_PCT = 0.3          # an opening gap bigger than this (in %) counts as a "big gap"
 ADX_MIN = 20
 MIN_SCORE = 3
@@ -73,6 +76,12 @@ DEFAULT_FILTERS = {
     "vwap": True,
     "volume": False,
     "gap": False,
+    # open-interest checks (research only: need saved option-chain history, see candle_research.py section 6)
+    "oi_pcr": False,
+    "oi_wall": False,
+    "oi_flow": False,
+    # "room": the target must not sit beyond the nearest key level ahead. OFF until judged (python strategy_lab.py --room-check)
+    "room": False,
 }
 
 FILTER_LABELS = {
@@ -87,6 +96,10 @@ FILTER_LABELS = {
     "vwap": "Price on the right side of VWAP",
     "volume": "Volume above its recent average",
     "gap": "Not trading against a big opening gap",
+    "oi_pcr": "Put/call open-interest ratio agrees",
+    "oi_wall": "Not right under a call wall / over a put wall",
+    "oi_flow": "Recent open-interest build-up agrees",
+    "room": "Room to the next key level (the target is not beyond it)",
 }
 
 
@@ -202,42 +215,59 @@ def add_vix(f: pd.DataFrame, vix_daily) -> pd.DataFrame:
     return f
 
 
-def add_vwap_volume_gap(f: pd.DataFrame) -> pd.DataFrame:
+def add_vwap_volume_gap(f: pd.DataFrame, fut: pd.DataFrame = None) -> pd.DataFrame:
     """
     vwap       : today's volume-weighted average price up to and including each candle.
-                 Yahoo gives NO volume for the indexes, so then every candle weighs the same
-                 (a plain average of today's prices, "vwap_proxy" = True).
-    vol_ratio  : candle volume / average of the last 20 candles (NaN when there is no volume).
+                 The weight is the volume of the index FUTURE (fut) when it is given, because the
+                 index itself has no volume. For a day without any volume every candle weighs the
+                 same (a plain average of the day's prices) and vwap_proxy is True for that day.
+    vol_ratio  : future volume of the candle / average of the last 20 candles (NaN without volume).
     gap_pct    : today's opening price vs yesterday's close, in %. Known from the first candle.
     Only past and current candles are used, so there is no look-ahead.
     """
     f = f.copy()
     day = pd.Series(f.index.normalize(), index=f.index)
     typical = (f["high"] + f["low"] + f["close"]) / 3
+
     vol = f["volume"].fillna(0).astype(float)
-    has_volume = bool(vol.sum() > 0)
-    weight = vol if has_volume else pd.Series(1.0, index=f.index)
+    if fut is not None and len(fut):
+        fv = fut["volume"].astype(float)
+        fv = fv[~fv.index.duplicated(keep="last")]
+        vol = fv.reindex(f.index).fillna(0.0)
+    day_volume = vol.groupby(day).transform("sum")
+    has_volume = day_volume > 0                               # per day: is there real volume?
+    weight = vol.where(has_volume, 1.0)
     num = (typical * weight).groupby(day).cumsum()
-    den = weight.groupby(day).cumsum().replace(0, np.nan)
+    den = weight.groupby(day).cumsum()
     f["vwap"] = num / den
-    f["vwap_proxy"] = not has_volume
-    f["vol_ratio"] = (vol / vol.shift(1).rolling(VOLUME_AVG_CANDLES).mean().replace(0, np.nan)
-                      if has_volume else np.nan)
+    f["vwap_proxy"] = ~has_volume
+
+    known = vol.where(vol > 0)                                # missing / zero volume is "unknown"
+    avg = known.shift(1).rolling(VOLUME_AVG_CANDLES, min_periods=VOLUME_AVG_CANDLES // 2).mean()
+    f["vol_ratio"] = known / avg.replace(0, np.nan)
+
     day_open = f["open"].groupby(day).transform("first")
     f["gap_pct"] = (day_open - f["pdc"]) / f["pdc"] * 100
     return f
 
 
-def compute_features(df: pd.DataFrame, index: str, interval_min: int, vix_daily=None) -> pd.DataFrame:
-    """Everything the engine needs for every candle. Input: finished candles only."""
+def compute_features(df: pd.DataFrame, index: str, interval_min: int, vix_daily=None,
+                     fut: pd.DataFrame = None, chain: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Everything the engine needs for every candle. Input: finished candles only.
+    fut = candles of the index future (same candle size) used only for its volume.
+    chain = saved option-chain table (candle_store.load_option_chain) used only for the optional oi_* checks.
+    """
     f = add_patterns(df)
     f = add_indicators(f)
     f = add_adx(f)
     f["htf15"] = higher_timeframe_trend(df, 15, interval_min)
     f["htf60"] = higher_timeframe_trend(df, 60, interval_min)
     f = add_levels(f)
-    f = add_vwap_volume_gap(f)
+    f = add_vwap_volume_gap(f, fut)
     f = add_vix(f, vix_daily)
+    from candle_chain import oi_features            # imported here: candle_chain does not need this module
+    f = f.join(oi_features(chain, f.index, interval_min))
 
     f["day"] = f.index.date
     f["start_min"] = f.index.hour * 60 + f.index.minute
@@ -280,6 +310,48 @@ def _level_check(S, atr: float, side: str):
         if pd.notna(lvl) and open_ >= lvl > close:
             return True, f"broke below {name} ({lvl:,.0f})"
     return False, "is not at any key level"
+
+
+def _entry_stop_risk(flt: dict, S, C, side: str, atr: float):
+    """Entry price, the signal candle's extreme and the stop distance (kept between 0.25 and 1.5 ATR)."""
+    if flt["confirm"]:
+        entry = float(C["close"])
+        raw_stop = float(S["low"]) if side == "CE" else float(S["high"])
+    else:
+        entry = float(S["high"]) if side == "CE" else float(S["low"])
+        raw_stop = float(S["low"]) if side == "CE" else float(S["high"])
+    risk = abs(entry - raw_stop)
+    return entry, raw_stop, min(max(risk, MIN_RISK_ATR * atr), MAX_RISK_ATR * atr)
+
+
+def room_info(C, side: str, entry: float, risk: float):
+    """
+    The nearest opposing key level ahead of the entry as {"name", "price", "points", "r"} (r = distance in units of the
+    stop distance), or None when there is none. Shown on every idea; the optional "room" check uses the same numbers.
+    CE: previous day high, opening range high, recent swing high. PE: previous day low, opening range low, swing low.
+    """
+    if risk <= 0:
+        return None
+    sign = 1 if side == "CE" else -1
+    named = ([("previous day high", C["pdh"]), ("opening range high", C["or_high"]), ("recent swing high", C["swing_high"])]
+             if side == "CE" else
+             [("previous day low", C["pdl"]), ("opening range low", C["or_low"]), ("recent swing low", C["swing_low"])])
+    ahead = [((lvl - entry) * sign, name, float(lvl)) for name, lvl in named if pd.notna(lvl) and (lvl - entry) * sign > 0]
+    if not ahead:
+        return None
+    distance, name, price = min(ahead)
+    return {"name": name, "price": round(price, 2), "points": round(distance, 1), "r": round(distance / risk, 2)}
+
+
+def room_ahead(C, side: str, entry: float, risk: float):
+    """The same as room_info, as (distance in R, name), or None when there is no level ahead."""
+    info = room_info(C, side, entry, risk)
+    if info is None:
+        return None
+    sign = 1 if side == "CE" else -1
+    named = ([C["pdh"], C["or_high"], C["swing_high"]] if side == "CE" else [C["pdl"], C["or_low"], C["swing_low"]])
+    distance = min((lvl - entry) * sign for lvl in named if pd.notna(lvl) and (lvl - entry) * sign > 0)
+    return distance / risk, info["name"]
 
 
 def _patterns_of(row) -> list:
@@ -409,6 +481,47 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
                     + (f"this trade goes against a big gap" if against else "no big gap against this trade"),
             "ok": not against, "required": True})
 
+    # --- room to the next key level (off by default) ---
+    entry, raw_stop, risk = _entry_stop_risk(flt, S, C, side, atr)
+    if flt["room"]:
+        ahead_info = room_ahead(C, side, entry, risk)
+        if ahead_info is None:
+            reasons.append({"key": "room", "text": "No key level between the entry and the target", "ok": True, "required": True})
+        else:
+            room, name = ahead_info
+            ok = room >= ROOM_MIN_R
+            reasons.append({
+                "key": "room",
+                "text": (f"The {name} is {room:.1f} R ahead: room for the target" if ok else
+                         f"The {name} is only {room:.1f} R ahead, before the {ROOM_MIN_R:g} R target"),
+                "ok": ok, "required": True})
+
+    # --- open-interest checks (off by default; skipped when there is no OI for this candle) ---
+    if flt["oi_pcr"] and pd.notna(C["oi_pcr"]):
+        ok = bool(C["oi_pcr"] >= OI_PCR_SPLIT) if side == "CE" else bool(C["oi_pcr"] <= OI_PCR_SPLIT)
+        reasons.append({
+            "key": "oi_pcr",
+            "text": f"Put/call OI ratio {C['oi_pcr']:.2f} - " + ("agrees" if ok else "does not agree"),
+            "ok": ok, "required": True})
+    if flt["oi_wall"] and pd.notna(C["oi_call_wall"]) and pd.notna(C["oi_put_wall"]):
+        if side == "CE":
+            gap_to = C["oi_call_wall"] - C["close"]                       # call wall above = a ceiling
+            blocked, name = 0 <= gap_to <= OI_WALL_ATR * atr, f"call wall {C['oi_call_wall']:,.0f}"
+        else:
+            gap_to = C["close"] - C["oi_put_wall"]                        # put wall below = a floor
+            blocked, name = 0 <= gap_to <= OI_WALL_ATR * atr, f"put wall {C['oi_put_wall']:,.0f}"
+        reasons.append({
+            "key": "oi_wall",
+            "text": (f"Price is right at the {name}" if blocked else f"Not right at the {name}"),
+            "ok": not blocked, "required": True})
+    if flt["oi_flow"] and pd.notna(C["oi_flow"]):
+        ok = bool(C["oi_flow"] >= 0) if side == "CE" else bool(C["oi_flow"] <= 0)
+        reasons.append({
+            "key": "oi_flow",
+            "text": f"Put-minus-call OI build-up {C['oi_flow'] * 100:+.1f}% in 30 min - "
+                    + ("agrees" if ok else "does not agree"),
+            "ok": ok, "required": True})
+
     # --- points: short-term trend and key level ---
     ema_ok = bool(C["ema9"] > C["ema21"]) if side == "CE" else bool(C["ema9"] < C["ema21"])
     reasons.append({
@@ -430,15 +543,7 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
     if score < MIN_SCORE:
         return _none("Pattern found, but not enough things agree. Wait.", reasons, score)
 
-    # --- levels: entry, stop loss, target ---
-    if flt["confirm"]:
-        entry = float(C["close"])
-        raw_stop = float(S["low"]) if side == "CE" else float(S["high"])
-    else:
-        entry = float(S["high"]) if side == "CE" else float(S["low"])
-        raw_stop = float(S["low"]) if side == "CE" else float(S["high"])
-    risk = abs(entry - raw_stop)
-    risk = min(max(risk, MIN_RISK_ATR * atr), MAX_RISK_ATR * atr)
+    # --- levels: entry, stop loss, target (entry and risk were worked out above) ---
     stop = entry - sign * risk
     target = entry + sign * REWARD_TO_RISK * risk
     step = STRIKE_STEP[index]
@@ -464,6 +569,7 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
         "atr": round(float(atr), 2),
         "gap_pct": None if pd.isna(C["gap_pct"]) else round(float(C["gap_pct"]), 2),
         "above_vwap": None if pd.isna(C["vwap"]) else bool(C["close"] > C["vwap"]),
+        "room": room_info(C, side, entry, risk),        # the nearest key level ahead (information; the "room" check is optional)
     }
 
     return {

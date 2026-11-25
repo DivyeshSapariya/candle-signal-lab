@@ -17,6 +17,7 @@ Every function returns a pandas table with columns:
 """
 
 import os
+import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -126,41 +127,104 @@ def _angel_login():
     return client
 
 
-ANGEL_CALL_GAP_SECONDS = 2.0        # Angel One refuses candle requests that come too fast
-ANGEL_RETRY_WAITS = (5, 10, 20, 40)   # seconds to wait before each retry after "exceeding access rate"
+ANGEL_CALL_GAP_SECONDS = 2.0        # Angel One refuses requests that come too fast
+ANGEL_RETRY_WAITS = (3, 6, 12)      # seconds to wait before each retry after "exceeding access rate"
 _angel_last_call = [0.0]
+_angel_lock = threading.RLock()     # the dashboard serves several requests at once; Angel One must see ONE at a time
+# Requests made for a page you are looking at go before background ones (the alert loop, refreshes that only
+# top up a cache). A background request waits while a page request is queued, but never longer than the limit below.
+BACKGROUND_MAX_WAIT_SECONDS = 10.0
+_angel_priority = threading.local()
+# counters for diagnosing slowness (shown in the page data as "timing")
+angel_stats = {"calls": 0, "rate_limited": 0, "wait_seconds": 0.0}
+angel_recent = []                      # the last calls: [clock time, outcome, seconds the call took, thread kind]
+_angel_page_waiting = [0]
+_angel_waiting_guard = threading.Lock()
+
+
+class background_requests:
+    """with background_requests(): ...   marks the Angel One calls made by this thread as low priority."""
+
+    def __enter__(self):
+        self._before = getattr(_angel_priority, "low", False)
+        _angel_priority.low = True
+
+    def __exit__(self, *exc):
+        _angel_priority.low = self._before
+
+
+def angel_too_fast(res=None, error=None) -> bool:
+    """True when Angel One answered 'too many requests' / 'exceeding access rate'."""
+    if error is not None:
+        return "access rate" in str(error).lower() or "too many requests" in str(error).lower()
+    return (isinstance(res, dict) and not res.get("status")
+            and ("too many requests" in str(res.get("message", "")).lower()
+                 or res.get("errorcode") == "AB1021"))
+
+
+def _angel_request(call):
+    """
+    Run ONE Angel One request (candles, price, ...) one at a time, with a pause after the previous
+    one, and a few retries when Angel One says 'too fast'. All Angel One calls should go through here.
+    """
+    import time
+
+    entered = time.time()
+    low = getattr(_angel_priority, "low", False)
+    if low:
+        give_up = time.time() + BACKGROUND_MAX_WAIT_SECONDS
+        while _angel_page_waiting[0] > 0 and time.time() < give_up:
+            time.sleep(0.1)                               # a page request is queued: let it go first
+    else:
+        with _angel_waiting_guard:
+            _angel_page_waiting[0] += 1
+    try:
+        with _angel_lock:
+            waits = ANGEL_RETRY_WAITS[:1] if low else ANGEL_RETRY_WAITS     # background work gives up early and tries again later
+            for attempt in range(len(waits) + 1):
+                wait = ANGEL_CALL_GAP_SECONDS - (time.time() - _angel_last_call[0])
+                if wait > 0:
+                    time.sleep(wait)
+                _angel_last_call[0] = time.time()
+                angel_stats["calls"] += 1
+                began = time.time()
+                try:
+                    res = call()
+                    if not angel_too_fast(res=res):
+                        angel_recent.append([round(began % 1000, 1), "ok", round(time.time() - began, 2), "bg" if low else "page"])
+                        del angel_recent[:-40]
+                        return res
+                    error = RuntimeError(str(res))
+                except Exception as raised:
+                    error = raised
+                    if not angel_too_fast(error=raised):
+                        raise
+                angel_recent.append([round(began % 1000, 1), "LIMITED", round(time.time() - began, 2), "bg" if low else "page"])
+                del angel_recent[:-40]
+                angel_stats["rate_limited"] += 1
+                if attempt == len(waits):
+                    raise error
+                time.sleep(waits[attempt])
+    finally:
+        angel_stats["wait_seconds"] += time.time() - entered
+        if not low:
+            with _angel_waiting_guard:
+                _angel_page_waiting[0] -= 1
 
 
 def _angel_get_candles(client, params: dict):
-    """getCandleData with a pause between calls and a few retries when Angel One says 'too fast'."""
-    import time
-
-    for attempt in range(len(ANGEL_RETRY_WAITS) + 1):
-        wait = ANGEL_CALL_GAP_SECONDS - (time.time() - _angel_last_call[0])
-        if wait > 0:
-            time.sleep(wait)
-        _angel_last_call[0] = time.time()
-        try:
-            res = client.getCandleData(params)
-            too_fast = (isinstance(res, dict) and not res.get("status")
-                        and ("too many requests" in str(res.get("message", "")).lower()
-                             or res.get("errorcode") == "AB1021"))
-            if not too_fast:
-                return res
-            error = RuntimeError(str(res))
-        except Exception as raised:
-            error = raised
-            too_fast = "access rate" in str(raised).lower()
-        if not too_fast or attempt == len(ANGEL_RETRY_WAITS):
-            raise error
-        time.sleep(ANGEL_RETRY_WAITS[attempt])
+    """getCandleData through the one-at-a-time, retrying request wrapper."""
+    return _angel_request(lambda: client.getCandleData(params))
 
 
 def fetch_angel_range(index: str, interval: str, start: datetime, end: datetime,
-                      allow_empty: bool = False) -> pd.DataFrame:
-    """Candles between two times (IST). Angel One limits how long one request may be (see candle_store)."""
+                      allow_empty: bool = False, instrument: tuple = None) -> pd.DataFrame:
+    """
+    Candles between two times (IST). Angel One limits how long one request may be (see candle_store).
+    instrument = (exchange, token) to fetch something other than the index, such as a future.
+    """
     client = _angel_login()
-    exchange, token = ANGEL_INDEX[index]
+    exchange, token = instrument or ANGEL_INDEX[index]
     params = {
         "exchange": exchange,
         "symboltoken": token,
@@ -215,6 +279,32 @@ def _load_scrip_master():
     return rows
 
 
+def angel_futures(index: str, now: datetime = None) -> list:
+    """Futures contracts of the index that have not expired yet, nearest first."""
+    segment, name = OPTION_SEGMENT[index]
+    now = now or datetime.now(IST)
+    out = []
+    for row in _load_scrip_master():
+        if (row.get("name") != name or row.get("exch_seg") != segment
+                or row.get("instrumenttype") != "FUTIDX"):
+            continue
+        try:
+            expiry = datetime.strptime(row["expiry"], "%d%b%Y").date()
+        except (KeyError, ValueError):
+            continue
+        if expiry < now.date() or (expiry == now.date() and now.hour * 60 + now.minute >= 15 * 60 + 30):
+            continue
+        out.append({"expiry": expiry, "symbol": row["symbol"], "token": row["token"], "exchange": segment})
+    return sorted(out, key=lambda c: c["expiry"])
+
+
+def fetch_angel_future(index: str, interval: str, start: datetime, end: datetime,
+                       contract: dict, allow_empty: bool = False) -> pd.DataFrame:
+    """Candles (with real volume) of one futures contract."""
+    return fetch_angel_range(index, interval, start, end, allow_empty,
+                             instrument=(contract["exchange"], contract["token"]))
+
+
 def fetch_angel_option(index: str, strike: int, side: str) -> dict:
     """
     Finds the nearest-expiry option contract and returns its live price.
@@ -246,11 +336,103 @@ def fetch_angel_option(index: str, strike: int, side: str) -> dict:
         raise RuntimeError(f"No {name} {strike} {side} contract found in Angel One list.")
 
     expiry, row = best
-    res = client.ltpData(segment, row["symbol"], row["token"])
+    res = _angel_request(lambda: client.ltpData(segment, row["symbol"], row["token"]))
     ltp = (res or {}).get("data", {}).get("ltp")
     if not ltp:
         raise RuntimeError(f"Angel One returned no option price: {res}")
     return {"ltp": float(ltp), "symbol": row["symbol"], "expiry": expiry}
+
+
+def angel_option_contracts(index: str, spot: float, strikes: int = 5, now: datetime = None) -> list:
+    """
+    The option contracts of the nearest expiry whose strike is within `strikes` steps of `spot`
+    (both calls and puts). Judged from 9:00 am of today so a contract that expires TODAY is still
+    included after the close. Returns [{expiry, symbol, token, exchange, strike, side}], sorted by strike.
+    """
+    segment, name = OPTION_SEGMENT[index]
+    now = (now or datetime.now(IST)).replace(hour=9, minute=0, second=0, microsecond=0)
+    rows = []
+    for row in _load_scrip_master():
+        if (row.get("name") != name or row.get("exch_seg") != segment
+                or row.get("instrumenttype") != "OPTIDX"):
+            continue
+        symbol = str(row.get("symbol", ""))
+        if not symbol.endswith(("CE", "PE")):
+            continue
+        try:
+            expiry = datetime.strptime(row["expiry"], "%d%b%Y").date()
+            strike = float(row["strike"]) / 100.0
+        except (KeyError, ValueError):
+            continue
+        if expiry < now.date():
+            continue
+        rows.append({"expiry": expiry, "symbol": symbol, "token": row["token"], "exchange": segment,
+                     "strike": strike, "side": symbol[-2:]})
+    if not rows:
+        return []
+    nearest = min(r["expiry"] for r in rows)
+    rows = [r for r in rows if r["expiry"] == nearest]
+    levels = sorted({r["strike"] for r in rows})
+    atm = min(range(len(levels)), key=lambda i: abs(levels[i] - spot))
+    keep = set(levels[max(0, atm - strikes): atm + strikes + 1])
+    return sorted((r for r in rows if r["strike"] in keep), key=lambda r: (r["strike"], r["side"]))
+
+
+def option_lot_size(index: str):
+    """Lot size of the index options from Angel One's public instrument list (no login). None if unknown."""
+    segment, name = OPTION_SEGMENT[index]
+    try:
+        for row in _load_scrip_master():
+            if row.get("name") == name and row.get("exch_seg") == segment and row.get("instrumenttype") == "OPTIDX":
+                return int(float(row["lotsize"]))
+    except Exception as error:
+        print(f"[lot size] not available: {error}")
+    return None
+
+
+def fetch_angel_option_oi(contracts: list) -> tuple:
+    """
+    Current open interest of option contracts (one read-only request for all of them).
+    Returns ({token: oi}, "dd-Mon-yyyy HH:MM:SS" time of the newest trade seen or "").
+    """
+    client = _angel_login()
+    by_exchange = {}
+    for c in contracts:
+        by_exchange.setdefault(c["exchange"], []).append(c["token"])
+    res = _angel_request(lambda: client.getMarketData("FULL", by_exchange))
+    if not (res or {}).get("status"):
+        raise RuntimeError(f"Angel One option OI failed: {str(res)[:200]}")
+    rows = (res.get("data") or {}).get("fetched") or []
+    oi = {str(r["symbolToken"]): float(r["opnInterest"]) for r in rows if r.get("opnInterest") is not None}
+    times = [str(r.get("exchTradeTime") or "") for r in rows if r.get("exchTradeTime")]
+    return oi, (max(times, key=lambda t: datetime.strptime(t, "%d-%b-%Y %H:%M:%S")) if times else "")
+
+
+def fetch_angel_option_history(contract: dict, start: datetime, end: datetime) -> pd.DataFrame:
+    """
+    5-minute history of ONE option contract: close, volume (from the candles) and open interest
+    (from the OI history). Read-only. Returns a table with an IST time index, columns close/volume/oi.
+    """
+    client = _angel_login()
+    params = {
+        "exchange": contract["exchange"], "symboltoken": contract["token"], "interval": "FIVE_MINUTE",
+        "fromdate": start.astimezone(IST).strftime("%Y-%m-%d %H:%M"),
+        "todate": end.astimezone(IST).strftime("%Y-%m-%d %H:%M"),
+    }
+    candles = _angel_request(lambda: client.getCandleData(dict(params)))
+    oi = _angel_request(lambda: client.getOIData(dict(params)))
+    for res in (candles, oi):
+        if not (res or {}).get("status"):
+            raise RuntimeError(f"Angel One option history failed: {str(res)[:200]}")
+    c = pd.DataFrame((candles.get("data") or []), columns=["datetime", "open", "high", "low", "close", "volume"])
+    o = pd.DataFrame((oi.get("data") or []), columns=["time", "oi"]) if oi.get("data") else pd.DataFrame(columns=["time", "oi"])
+    if c.empty:
+        return pd.DataFrame(columns=["close", "volume", "oi"], index=pd.DatetimeIndex([], tz=IST, name="datetime"))
+    c["datetime"] = pd.to_datetime(c["datetime"], utc=True).dt.tz_convert(IST)
+    o["datetime"] = pd.to_datetime(o["time"], utc=True).dt.tz_convert(IST)
+    df = c.set_index("datetime")[["close", "volume"]].join(o.set_index("datetime")[["oi"]], how="left")
+    df.index.name = "datetime"
+    return df
 
 
 # ---------------------------------------------------------------------------

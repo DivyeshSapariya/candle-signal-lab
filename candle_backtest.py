@@ -117,7 +117,11 @@ def simulate_trade(f: pd.DataFrame, i: int, plan: dict, interval_min: int,
         favour = (h[k] - fill) if sign == 1 else (fill - l[k])
         against = (fill - l[k]) if sign == 1 else (h[k] - fill)
         peak, dd = max(peak, favour), max(dd, against)
-        last_of_day = start_min[k] + interval_min >= MARKET_CLOSE_MIN
+        # the last candle of a day closes the trade. That is the 15:25 candle, or the newest candle of the day when
+        # the next candle belongs to another day (a feed with no 15:25 candle must not leave the trade open forever).
+        # When the data simply ends (k + 1 == n, today's session still running) the trade stays open.
+        last_of_day = (start_min[k] + interval_min >= MARKET_CLOSE_MIN
+                       or (k + 1 < n and days[k + 1] != days[k]))
         if last_of_day or bars >= max_hold:
             return done("TIME", fill, k, float(c[k]), stop, target, bars=bars, peak=peak, dd=dd)
 

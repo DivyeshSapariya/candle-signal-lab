@@ -1,0 +1,6 @@
+# NSE / BSE exchange holidays that fall on a weekday. One per line: date,name
+# Lines starting with # are ignored. Add rows from the official NSE / BSE holiday calendar.
+# Saving this file is enough: the tool notices the change by itself (no restart needed).
+date,name
+2026-11-24,Guru Nanak Jayanti
+2026-12-25,Christmas
