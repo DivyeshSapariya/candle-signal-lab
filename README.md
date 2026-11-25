@@ -533,7 +533,23 @@ Question: would a smaller target (a quick small gain per share instead of 2 time
 | `rs10`, `rs20` | where an at-the-money option has gained Rs 10 / Rs 20 per share |
 | `pct30`, `pct50` | where an at-the-money option has gained 30% / 50% of its price |
 
-The option variants turn the gain into an index distance with Black-Scholes (the option's price at entry from the previous day's India VIX and the time to the nearest weekly expiry); that distance divided by the stop distance is that trade's reward : risk (kept between 0.1 and 6). Time decay after the entry is not included, so these variants are a little easier than reality; with no VIX value no trade is made. The same gate as in section 7d applies, and the random-entry comparison copies the stop size and the reward : risk of the real trades. It writes nothing and changes no live rule. **Result on the one-year data: see below (added when the run finishes).**
+The option variants turn the gain into an index distance with Black-Scholes (the option's price at entry from the previous day's India VIX and the time to the nearest weekly expiry); that distance divided by the stop distance is that trade's reward : risk (kept between 0.1 and 6). Time decay after the entry is not included, so these variants are a little easier than reality; with no VIX value no trade is made. The same gate as in section 7d applies, and the random-entry comparison copies the stop size and the reward : risk of the real trades. It writes nothing and changes no live rule. **Result on the one-year data (249 trading days, 24 tests): 0 passed the gate.** Average net result per trade in R, after the 0.1 R cost:
+
+| Variant | NIFTY 5m | NIFTY 15m | SENSEX 5m | SENSEX 15m |
+|---|---|---|---|---|
+| `r0.5` | -0.13 | -0.04 | -0.09 | -0.09 |
+| `r1.0` | -0.13 | +0.05 | -0.06 | +0.03 |
+| `rs10` | -0.12 | -0.03 | -0.14 | -0.10 |
+| `rs20` | -0.22 | +0.04 | -0.15 | -0.09 |
+| `pct30` | -0.11 | +0.04 | -0.09 | -0.03 |
+| `pct50` | -0.05 | +0.01 | -0.07 | +0.03 |
+| Current rules (target 2.0) | -0.12 | -0.02 | -0.05 | +0.07 |
+
+What it shows:
+- **Smaller targets are hit much more often** (0.5 R: 60 to 68% of trades; Rs 10 on SENSEX: 78 to 87%), but the payoff shrinks by the same amount, so the average stays at or below zero. The hit rate rises exactly as fast as the break-even rate does. The 5m results are negative for every variant, and almost all are negative at a 0.2 R cost.
+- **A rupee target means a different size on each market.** The average Rs 10 target is about 0.78 R on NIFTY 5m but only 0.14 to 0.24 R on SENSEX, because the same Rs 10 needs a much smaller index move relative to the stop. A 0.14 R target hit 87% of the time still loses 0.10 R, because the 0.1 R cost is bigger than the average gain. Very small targets cannot pay their costs unless nearly every trade wins.
+- **The best-looking cells are the 15m results around zero** (`r1.0`: +0.05 NIFTY, +0.03 SENSEX; `rs20` and `pct30` on NIFTY: +0.04). Their 95% ranges include zero, they do not beat random entries at p < 0.01 (the closest are p = 0.06 and 0.057), and there are 24 tests, so they are noise until proven otherwise.
+- **Conclusion:** a smaller target on these entries does not create an edge. What is missing is the prediction, not the target size. The option variants are also a little optimistic (no time decay after the entry). Re-run it as the data grows: `python strategy_lab.py --short-targets`.
 
 ---
 
