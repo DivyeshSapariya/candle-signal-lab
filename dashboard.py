@@ -1700,6 +1700,16 @@ function renderTrade(d) {
   kv(box, 'Stop loss at', fmt(p.stop), 'down');
   kv(box, 'Target at', fmt(p.target), 'up');
   kv(box, 'Risk : reward', p.risk_points.toFixed(1) + ' : ' + p.reward_points.toFixed(1) + ' points');
+  const rm = p.context && p.context.room;
+  if (rm) {
+    kv(box, 'Next key level', rm.name + ' ' + fmt(rm.price));
+    kv(box, 'Distance to it', rm.points.toFixed(0) + ' points \u00B7 ' + rm.r.toFixed(1) + ' R', rm.r < 2 ? 'down' : 'up');
+    box.appendChild(h('div', 'muted small', rm.r < 2
+      ? 'It is before the 2 R target: price often stalls or turns at a level like this. Only information, no rule uses it.'
+      : 'There is room for the 2 R target before it. Only information, no rule uses it.'));
+  } else if (p.context) {
+    box.appendChild(h('div', 'muted small', 'No key level (previous day, opening range, recent swing) between the entry and the target.'));
+  }
 
   if (p.lot) {
     box.appendChild(h('div', 'group', 'Per lot (' + p.lot.size + ' units)'));
@@ -1742,6 +1752,7 @@ function renderTrade(d) {
   addLine(p.entry, '#4da3ff', 'ENTRY');
   addLine(p.stop, '#ff7a70', 'STOP LOSS');
   addLine(p.target, '#2bd4b4', 'TARGET');
+  if (rm) addLine(rm.price, '#9aa8b6', 'NEXT LEVEL');
 }
 
 // ---------------- daily risk limits (only shown when set in .env) ----------------
@@ -1910,6 +1921,7 @@ function buildDetail(it) {
     kv(lv, 'Stop loss at', rs(ol.stop_price), 'down');
     kv(lv, 'Target at', rs(ol.target_price), 'up');
     kv(lv, 'Loss / profit per unit', '-' + rs(ol.loss_per_unit) + '  /  +' + rs(ol.profit_per_unit));
+    if (it.room) kv(lv, 'Next key level at entry', it.room.name + ' ' + fmt(it.room.price) + ' (' + it.room.r.toFixed(1) + ' R ahead)');
     const lotSize = histData && histData.lot_sizes ? histData.lot_sizes[it.index] : null;
     if (lotSize) kv(lv, 'Per lot of ' + lotSize + ' (today\'s lot size)', '-' + rs0(ol.loss_per_unit * lotSize) + '  /  +' + rs0(ol.profit_per_unit * lotSize));
     const srcText = ol.captured === 'live'

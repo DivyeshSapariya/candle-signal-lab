@@ -324,9 +324,10 @@ def _entry_stop_risk(flt: dict, S, C, side: str, atr: float):
     return entry, raw_stop, min(max(risk, MIN_RISK_ATR * atr), MAX_RISK_ATR * atr)
 
 
-def room_ahead(C, side: str, entry: float, risk: float):
+def room_info(C, side: str, entry: float, risk: float):
     """
-    The nearest opposing key level ahead of the entry: (distance in R, its name), or None when there is none.
+    The nearest opposing key level ahead of the entry as {"name", "price", "points", "r"} (r = distance in units of the
+    stop distance), or None when there is none. Shown on every idea; the optional "room" check uses the same numbers.
     CE: previous day high, opening range high, recent swing high. PE: previous day low, opening range low, swing low.
     """
     if risk <= 0:
@@ -335,11 +336,22 @@ def room_ahead(C, side: str, entry: float, risk: float):
     named = ([("previous day high", C["pdh"]), ("opening range high", C["or_high"]), ("recent swing high", C["swing_high"])]
              if side == "CE" else
              [("previous day low", C["pdl"]), ("opening range low", C["or_low"]), ("recent swing low", C["swing_low"])])
-    ahead = [((lvl - entry) * sign, name) for name, lvl in named if pd.notna(lvl) and (lvl - entry) * sign > 0]
+    ahead = [((lvl - entry) * sign, name, float(lvl)) for name, lvl in named if pd.notna(lvl) and (lvl - entry) * sign > 0]
     if not ahead:
         return None
-    distance, name = min(ahead)
-    return distance / risk, name
+    distance, name, price = min(ahead)
+    return {"name": name, "price": round(price, 2), "points": round(distance, 1), "r": round(distance / risk, 2)}
+
+
+def room_ahead(C, side: str, entry: float, risk: float):
+    """The same as room_info, as (distance in R, name), or None when there is no level ahead."""
+    info = room_info(C, side, entry, risk)
+    if info is None:
+        return None
+    sign = 1 if side == "CE" else -1
+    named = ([C["pdh"], C["or_high"], C["swing_high"]] if side == "CE" else [C["pdl"], C["or_low"], C["swing_low"]])
+    distance = min((lvl - entry) * sign for lvl in named if pd.notna(lvl) and (lvl - entry) * sign > 0)
+    return distance / risk, info["name"]
 
 
 def _patterns_of(row) -> list:
@@ -557,6 +569,7 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
         "atr": round(float(atr), 2),
         "gap_pct": None if pd.isna(C["gap_pct"]) else round(float(C["gap_pct"]), 2),
         "above_vwap": None if pd.isna(C["vwap"]) else bool(C["close"] > C["vwap"]),
+        "room": room_info(C, side, entry, risk),        # the nearest key level ahead (information; the "room" check is optional)
     }
 
     return {

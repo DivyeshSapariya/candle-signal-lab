@@ -398,6 +398,7 @@ def history(limit: int = 100) -> dict:
             "peak_r": _num(row["peak_r"]), "dd_r": _num(row["dd_r"]),
             "story": row["story"],
             "setup": setup_line(_json(row["context"], {})),
+            "room": (_json(row["context"], {}) or {}).get("room"),
             "vix": (_json(row["context"], {}) or {}).get("vix"),
             "option_levels": _json(row["option_levels"], None),
             "reasons": _json(row["reasons"], []),

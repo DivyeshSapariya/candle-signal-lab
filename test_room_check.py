@@ -68,6 +68,34 @@ def main():
     assert reason["ok"] and "2.5 R ahead" in reason["text"] and res["signal"] == side
     assert res["entry"] == entry and abs(res["stop"] - plan["stop"]) < 1e-9, "entry and stop are the same as before"
 
+    # --- the nearest level is shown on every idea (information, whatever the check is set to) ---
+    info = cs.room_info(row(pdh=25150.0, or_high=25300.0), "CE", 25000.0, 100.0)
+    assert info == {"name": "previous day high", "price": 25150.0, "points": 150.0, "r": 1.5}, info
+    assert cs.room_info(row(), "CE", 25000.0, 100.0) is None and cs.room_info(row(pdh=25100.0), "CE", 25000.0, 0.0) is None
+    g2 = f.copy()
+    for c in cols:
+        g2.iloc[i, g2.columns.get_loc(c)] = np.nan
+    assert cs.evaluate(g2, i, "nifty", 5, loose)["context"]["room"] is None, "no level ahead: nothing to show"
+    g2.iloc[i, g2.columns.get_loc(cols[1])] = entry + sign * 1.5 * risk
+    ctx = cs.evaluate(g2, i, "nifty", 5, loose)["context"]["room"]               # the check is OFF here, the level is still shown
+    assert ctx["r"] == 1.5 and ctx["points"] == round(1.5 * risk, 1) and abs(ctx["price"] - (entry + sign * 1.5 * risk)) < 0.01
+    assert cs.evaluate(g2, i, "nifty", 5, loose)["signal"] == side, "showing the level never changes the decision"
+
+    # saved with the idea, and given back by the history
+    import json
+    import os
+    import tempfile
+
+    import candle_journal as cj
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cj.JOURNAL_FILE = os.path.join(tmp, "j.csv")
+        cj.SNAPSHOT_DIR = os.path.join(tmp, "snaps")
+        plan2 = cs.evaluate(g2, i, "nifty", 5, loose)
+        json.dumps(plan2["context"])                                              # must be saveable
+        assert cj.record_idea(plan2, "nifty", "5m", "now")
+        item = cj.history()["items"][0]
+        assert item["room"]["name"] == ctx["name"] and item["room"]["r"] == 1.5
+
     # --- no look-ahead: the same decision with or without later candles ---
     for j in range(40, len(df) - 1, 11):
         a = cs.evaluate(f, j, "nifty", 5, on)
