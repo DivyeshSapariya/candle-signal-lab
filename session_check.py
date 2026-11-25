@@ -6,6 +6,14 @@ A read-only end-of-day check. It writes nothing and places no orders. Run it aft
     python session_check.py                    # today
     python session_check.py --date 2026-11-25  # another day
     python session_check.py --no-live          # skip the live data check (no Angel One / Yahoo request)
+    python session_check.py --auto             # what the 16:00 scheduled task runs (see below)
+
+AUTOMATIC MODE (--auto). The Windows task "AI-Trading-Candle-Collect" runs it as its last step, after the candles,
+futures volume and option open interest of the day are saved. It checks the most recent session that has closed,
+writes the report to reports/session_check_<date>.txt, and sends a short summary to Telegram (when Telegram is set up).
+It does nothing on weekends and holidays, never repeats a day whose report already exists (use --force), and if the PC
+was off at 16:00 it checks the last closed session the next time the task runs. It never asks the data source for live
+candles (after the close the saved data tells the story) and it places no orders.
 
 It reports, in plain lines marked OK / CHECK / INFO:
   1. whether it was a trading day (weekend, holiday from holidays.csv)
@@ -25,7 +33,10 @@ import pandas as pd
 
 import telegram_notify as tg
 from data_sources import IST
-from option_pricer import is_holiday
+from option_pricer import is_holiday, previous_trading_day
+
+REPORT_DIR = "reports"
+CLOSED_AFTER_MINUTES = 15 * 60 + 45        # the session counts as closed and saved from 15:45
 
 OK, CHECK, INFO = "OK   ", "CHECK", "INFO "
 
@@ -130,37 +141,105 @@ def live_lines(day: date, now: datetime) -> list:
     return lines
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Read-only end-of-day check.")
-    ap.add_argument("--date", help="YYYY-MM-DD (default: today)")
-    ap.add_argument("--no-live", action="store_true", help="do not ask the data source for live candles")
-    ap.add_argument("--db", default="market_data.db")
-    a = ap.parse_args()
-    tg.load_env_file()
-    now = datetime.now(IST)
-    day = date.fromisoformat(a.date) if a.date else now.date()
-
+def build_sections(day: date, now: datetime, db: str, live: bool) -> list:
     sections = [("Trading day", trading_day_lines(day))]
     if day.weekday() < 5 and not is_holiday(day):
-        if not a.no_live:
+        if live:
             sections.append(("Live data", live_lines(day, now)))
         import candle_journal
         sections.append(("Journal", journal_lines(candle_journal._load(), day)))
-        if os.path.exists(a.db):
-            con = sqlite3.connect(a.db)
+        if os.path.exists(db):
+            con = sqlite3.connect(db)
             try:
                 sections.append(("Saved data", db_lines(con, day)))
             finally:
                 con.close()
         else:
-            sections.append(("Saved data", [(CHECK, f"{a.db} not found. Run: python candle_store.py collect")]))
+            sections.append(("Saved data", [(CHECK, f"{db} not found. Run: python candle_store.py collect")]))
     sections.append(("Settings", settings_lines()))
+    return sections
+
+
+def render(sections: list) -> tuple:
+    """(text, number of CHECK items)."""
+    out = []
     for title, lines in sections:
-        print(f"\n{title}")
-        for flag, text in lines:
-            print(f"  {flag} {text}")
+        out.append(f"\n{title}")
+        out.extend(f"  {flag} {text}" for flag, text in lines)
     problems = sum(1 for _, lines in sections for flag, _ in lines if flag == CHECK)
-    print(f"\n{problems} item(s) to CHECK." if problems else "\nNothing to check.")
+    out.append(f"\n{problems} item(s) to CHECK." if problems else "\nNothing to check.")
+    return "\n".join(out), problems
+
+
+def session_day_to_check(now: datetime):
+    """The most recent trading day whose session has closed (today after 15:45, else the trading day before)."""
+    today = now.date()
+    if today.weekday() < 5 and not is_holiday(today) and now.hour * 60 + now.minute >= CLOSED_AFTER_MINUTES:
+        return today
+    return previous_trading_day(today - timedelta(days=1))
+
+
+def report_path(day: date, folder: str = REPORT_DIR) -> str:
+    return os.path.join(folder, f"session_check_{day.isoformat()}.txt")
+
+
+def telegram_summary(day: date, sections: list, problems: int) -> str:
+    """A short message: the day's ideas and results, and every item that needs a look."""
+    lines = [f"End-of-day check, {day:%a %d %b %Y}"]
+    for title, section in sections:
+        if title == "Journal":
+            lines += [text for _, text in section]
+    flagged = [text for _, section in [(t, ls) for t, ls in sections] for flag, text in section if flag == CHECK]
+    lines.append("")
+    lines += ([f"{problems} item(s) to check:"] + [f"- {t}" for t in flagged]) if problems else ["Nothing to check."]
+    lines.append("Full report: reports/session_check_" + day.isoformat() + ".txt")
+    return "\n".join(lines)
+
+
+def run_auto(now: datetime, db: str = "market_data.db", folder: str = REPORT_DIR, force: bool = False, send=True):
+    """
+    The automatic end-of-day check. Returns the report path, or None when there was nothing to do
+    (not a trading day, or this day was already reported).
+    """
+    day = session_day_to_check(now)
+    if day.weekday() >= 5 or is_holiday(day):
+        print(f"{day} is not a trading day: nothing to check.")
+        return None
+    path = report_path(day, folder)
+    if os.path.exists(path) and not force:
+        print(f"{day} was already checked ({path}).")
+        return None
+    sections = build_sections(day, now, db, live=False)
+    text, problems = render(sections)
+    os.makedirs(folder, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f"End-of-day check for {day:%a %d %b %Y} (made {now:%d %b %H:%M})\n{text}\n")
+    print(text)
+    if send and tg.is_configured():
+        try:
+            tg.send_message(telegram_summary(day, sections, problems))
+        except Exception as error:                      # the report is saved either way
+            print(f"[telegram] summary not sent: {error}")
+    return path
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Read-only end-of-day check.")
+    ap.add_argument("--date", help="YYYY-MM-DD (default: today)")
+    ap.add_argument("--no-live", action="store_true", help="do not ask the data source for live candles")
+    ap.add_argument("--auto", action="store_true",
+                    help="automatic mode: check the last closed session, save a report, send a Telegram summary")
+    ap.add_argument("--force", action="store_true", help="with --auto: redo a day that was already reported")
+    ap.add_argument("--db", default="market_data.db")
+    a = ap.parse_args()
+    tg.load_env_file()
+    now = datetime.now(IST)
+    if a.auto:
+        run_auto(now, a.db, force=a.force)
+        return
+    day = date.fromisoformat(a.date) if a.date else now.date()
+    text, _ = render(build_sections(day, now, a.db, live=not a.no_live))
+    print(text)
 
 
 if __name__ == "__main__":

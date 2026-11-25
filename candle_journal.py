@@ -293,6 +293,14 @@ def today_stats(day) -> dict:
     return {"ideas": ideas, "net_r": round(net, 4)}
 
 
+def waiting_markets() -> set:
+    """(index, interval) of every saved idea that has no final result yet (waiting for entry, or running)."""
+    with _lock:
+        df = _load()
+    open_rows = df[df["status"].isin(["PENDING", "OPEN"])]
+    return {(str(r["index"]), str(r["interval"])) for _, r in open_rows.iterrows()}
+
+
 def _status_of(key: str):
     """(status, note) of a saved idea, or None when it is new."""
     with _lock:

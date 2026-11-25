@@ -594,6 +594,45 @@ def _alert_markets() -> list:
 
 
 ALERT_CANDLE_GRACE_SECONDS = 10       # after the close, one look this long after 3:30 pm is enough
+_waiting_seen = {}                    # market -> (time, {"latest": {"time": newest finished candle}}) of the last results check
+
+
+def _send_result_alert(info: dict) -> None:
+    tg.send_async(tg.format_result(info))
+
+
+def _update_waiting_ideas(source: str, watched: set, now: datetime) -> int:
+    """
+    Check the result of saved ideas whose market is NOT one the alert loop watches and that nobody has open
+    in the page (for example a 15-minute idea found while someone looked at 15 minutes). Without this such an
+    idea would stay "waiting" until its market is looked at again. It only fetches candles and settles ideas
+    that are already saved: it never makes a new idea and never sends a new-idea alert (the result alert goes
+    out only for an idea that had a new-idea alert). Once per candle per market, with low priority in the
+    Angel One queue. Returns how many markets were updated.
+    """
+    done = 0
+    for index, interval in sorted(journal.waiting_markets()):
+        interval_min = INTERVAL_MINUTES.get(interval)
+        if interval_min is None or (index, interval) in watched:
+            continue                                        # watched markets are settled by their normal build
+        if now.hour * 60 + now.minute < 9 * 60 + 15 + interval_min:
+            continue                                        # before the first candle of the day has closed
+        key = (source, index, interval)
+        for seen in (_cache.get(key), _waiting_seen.get(key)):
+            if seen and _candle_already_seen(seen, interval_min, now):
+                break                                       # already settled with the candle that just closed
+        else:
+            try:
+                finished = drop_forming_candle(get_candles(source, index, interval, include_forming=True), interval)
+                if len(finished) < 5:
+                    continue
+                features = compute_features(finished, index, interval_min, get_vix_daily(), None)
+                journal.update_results(features, index, interval_min, _send_result_alert)
+                _waiting_seen[key] = (time.time(), {"latest": {"time": finished.index[-1].strftime("%d %b %H:%M")}})
+                done += 1
+            except Exception as error:
+                print(f"[waiting ideas] {index} {interval}: {error}")
+    return done
 
 
 def _candle_already_seen(cached, interval_min: int, now: datetime) -> bool:
@@ -638,6 +677,10 @@ def _alert_tick(source: str = None, markets: list = None) -> int:
             checked += 1
         except Exception as error:
             print(f"[alerts] {index} {interval}: {error}")
+    try:                                                   # settle ideas of markets nobody is looking at
+        _update_waiting_ideas(source, set(markets or _alert_markets()), now)
+    except Exception as error:
+        print(f"[waiting ideas] {error}")
     return checked
 
 
@@ -799,6 +842,7 @@ PAGE = r"""<!DOCTYPE html>
   .col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
   .t1main { flex: 999 1 600px; min-width: 0; display: flex; flex-direction: column; }
   .t1side { flex: 1 1 340px; }
+  .t1side > #cardChain { flex: 1 1 auto; }
   .t2a { flex: 1 1 300px; } .t2b { flex: 1 1 380px; } .t2c { flex: 1 1 300px; }
   .t3a { flex: 1 1 480px; } .t3b { flex: 1 1 480px; }
   .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px; box-shadow: var(--shadow); min-width: 0; }
@@ -824,7 +868,7 @@ PAGE = r"""<!DOCTYPE html>
   .chartopts .brk { flex: 0 0 100%; height: 0; }
   .chartopts .zl { font-size: 11px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; font-weight: 600; margin-right: 2px; }
   .lg { display: inline-block; width: 14px; height: 3px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
-  #chart { height: clamp(300px, calc(100vh - 470px), 620px); border-radius: 6px; overflow: hidden; }
+  #chart { flex: 1 1 0; min-height: clamp(300px, calc(100vh - 470px), 620px); border-radius: 6px; overflow: hidden; }
   .subpanel { margin-top: 6px; }
   .subpanel .subtitle { font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; font-weight: 600; color: var(--muted); padding: 2px 0 2px 4px; }
   .subchart { height: 96px; border-radius: 6px; overflow: hidden; }
@@ -838,17 +882,17 @@ PAGE = r"""<!DOCTYPE html>
   .ftiles:empty { display: none; }
 
   /* latest candle */
-  .lcwrap { display: flex; gap: 16px; align-items: stretch; }
-  #lcSvg { flex: none; background: var(--surface2); border-radius: 10px; }
-  .ohlc { flex: 1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-  .ohlc > div { background: var(--surface2); border-radius: 8px; padding: 6px 10px; }
+  .lcwrap { display: flex; gap: 10px; align-items: stretch; }
+  #lcSvg { flex: none; width: 32px; height: 74px; background: var(--surface2); border-radius: 8px; }
+  .ohlc { flex: 1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+  .ohlc > div { background: var(--surface2); border-radius: 6px; padding: 2px 8px; display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
   .ohlc .lbl { font-size: 11px; color: var(--muted); }
-  .ohlc .val { font-weight: 600; font-size: 14px; font-family: var(--mono); }
-  .lctiles { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
-  .lctiles > div { flex: 1 1 120px; background: var(--surface2); border-radius: 10px; padding: 10px 12px; }
-  .lctiles .lbl { font-size: 12px; color: var(--muted); }
-  .lctiles .val { font-size: 15px; font-weight: 700; }
-  .pat { margin-top: 8px; padding: 10px 12px; border: 1px dashed var(--line); border-radius: 10px; font-size: 13.5px; color: var(--soft); }
+  .ohlc .val { font-weight: 600; font-size: 12.5px; font-family: var(--mono); }
+  .lctiles { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .lctiles > div { flex: 1 1 100px; background: var(--surface2); border-radius: 8px; padding: 4px 10px; display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
+  .lctiles .lbl { font-size: 11.5px; color: var(--muted); }
+  .lctiles .val { font-size: 13px; font-weight: 700; }
+  .pat { margin-top: 6px; padding: 5px 10px; border: 1px dashed var(--line); border-radius: 8px; font-size: 12.5px; color: var(--soft); }
   .pat + .pat { margin-top: 6px; }
   .pat .name { font-weight: 700; margin-right: 8px; color: var(--text); }
 
@@ -929,19 +973,19 @@ PAGE = r"""<!DOCTYPE html>
 
   /* option chain (open interest) */
   .oi-sub { font-size: 12px; color: var(--muted); margin: 2px 0 8px; }
-  .oi-row { display: grid; grid-template-columns: minmax(0, 1fr) 54px minmax(0, 1fr); gap: 6px; align-items: center;
+  .oi-row { display: grid; grid-template-columns: minmax(0, 1fr) 48px minmax(0, 1fr); gap: 4px; align-items: center;
             padding: 1px 4px; border-radius: 6px; font-family: var(--mono); }
   .oi-row.near { background: var(--surface2); }
   .oi-row .stk { text-align: center; font-size: 12px; font-weight: 700; padding: 2px 0; border-radius: 6px; }
   .oi-row.near .stk { background: var(--text); color: var(--bg); }
   .oi-head { font-family: var(--sans); font-size: 11px; font-weight: 600; color: var(--muted); padding-bottom: 6px; }
   .oi-head .ce { text-align: right; color: var(--red); } .oi-head .pe { color: var(--green); } .oi-head .stk { color: var(--muted); }
-  .oi-cell { display: flex; align-items: center; gap: 6px; min-width: 0; white-space: nowrap; }
+  .oi-cell { display: flex; align-items: center; gap: 4px; min-width: 0; white-space: nowrap; }
   .oi-cell.ce { justify-content: flex-end; }
-  .oi-v { font-size: 11.5px; min-width: 38px; }
+  .oi-v { font-size: 11px; min-width: 34px; }
   .oi-cell.ce .oi-v { text-align: right; }
-  .oi-chg { font-size: 10.5px; color: var(--muted); }
-  .oi-bw { flex: none; width: 62px; height: 8px; display: flex; }
+  .oi-chg { font-size: 10px; color: var(--muted); }
+  .oi-bw { flex: none; width: 34px; height: 8px; display: flex; }
   .oi-cell.ce .oi-bw { justify-content: flex-end; }
   .oi-bar { min-width: 2px; height: 8px; }
   .oi-bar.ce { background: var(--red); border-radius: 3px 0 0 3px; }
@@ -967,7 +1011,7 @@ PAGE = r"""<!DOCTYPE html>
     .tile { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
     .hrow { grid-template-columns: 1fr auto; row-gap: 2px; }
     .hrow .r { text-align: left; }
-    #chart { height: clamp(280px, 48vh, 460px); }
+    #chart { min-height: clamp(280px, 48vh, 460px); }
   }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
@@ -1058,20 +1102,6 @@ PAGE = r"""<!DOCTYPE html>
       </section>
     </div>
     <div class="col t1side">
-      <section class="card" id="cardWhy">
-        <h3>Why this decision</h3>
-        <div id="why" class="muted">--</div>
-      </section>
-      <section class="card" id="cardTrade" style="display:none">
-        <h3>Trade details</h3>
-        <div id="trade"></div>
-      </section>
-    </div>
-  </div>
-
-  <!-- TIER 2: context -->
-  <div class="tier top">
-    <div class="col t2a">
       <section class="card" aria-label="Latest finished candle">
         <h3>Latest finished candle <span class="hint" id="lcTime"></span></h3>
         <div class="lcwrap">
@@ -1089,16 +1119,30 @@ PAGE = r"""<!DOCTYPE html>
         </div>
         <div id="patterns"></div>
       </section>
+      <section class="card" id="cardChain" aria-label="Option chain">
+        <h3>Option chain (open interest) <span class="hint">&middot; context only</span></h3>
+        <div class="oi-sub" id="oiMeta"></div>
+        <div id="oiBody" class="muted">--</div>
+      </section>
+      <section class="card" id="cardTrade" style="display:none">
+        <h3>Trade details</h3>
+        <div id="trade"></div>
+      </section>
+    </div>
+  </div>
+
+  <!-- TIER 2: context -->
+  <div class="tier top">
+    <div class="col t2a">
       <section class="card" aria-label="Recent candle patterns">
         <h3>Recent candle patterns</h3>
         <div id="recent" class="list muted">--</div>
       </section>
     </div>
     <div class="col t2b">
-      <section class="card" id="cardChain" aria-label="Option chain">
-        <h3>Option chain (open interest) <span class="hint">&middot; context only</span></h3>
-        <div class="oi-sub" id="oiMeta"></div>
-        <div id="oiBody" class="muted">--</div>
+      <section class="card" id="cardWhy">
+        <h3>Why this decision</h3>
+        <div id="why" class="muted">--</div>
       </section>
     </div>
     <div class="col t2c">

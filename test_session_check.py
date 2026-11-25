@@ -78,7 +78,52 @@ def main():
     # --- settings lines run without any env ---
     assert sc.settings_lines()
 
-    print("OK: trading day, data freshness, journal summary, saved-data and collection-run checks")
+    # --- the automatic mode: which day, report file, Telegram summary, never twice, never on a non-trading day ---
+    wed_after = datetime(2026, 11, 25, 16, 0, tzinfo=IST)
+    assert sc.session_day_to_check(wed_after) == date(2026, 11, 25)
+    assert sc.session_day_to_check(datetime(2026, 11, 25, 11, 0, tzinfo=IST)) == date(2026, 11, 23), "before the close: the last closed day (24 Nov is a holiday)"
+    assert sc.session_day_to_check(datetime(2026, 11, 28, 12, 0, tzinfo=IST)) == date(2026, 11, 27), "Saturday: Friday"
+    assert sc.session_day_to_check(datetime(2026, 11, 30, 9, 0, tzinfo=IST)) == date(2026, 11, 27), "Monday morning: Friday"
+    assert sc.session_day_to_check(datetime(2026, 11, 24, 16, 30, tzinfo=IST)) == date(2026, 11, 23), "a holiday: the day before"
+    assert sc.report_path(date(2026, 11, 25), "r").replace("\\", "/") == "r/session_check_2026-11-25.txt"
+
+    import candle_journal as cj
+    sent = []
+    sc.tg.is_configured = lambda: True
+    sc.tg.send_message = lambda text: sent.append(text)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cj.JOURNAL_FILE = os.path.join(tmp, "j.csv")
+        db = os.path.join(tmp, "t.db")
+        con = candle_store.connect(db)
+        base = int(datetime(2026, 11, 25, 9, 15, tzinfo=IST).timestamp())
+        con.executemany("INSERT INTO candles VALUES ('nifty','5m',?,1,1,1,1,0)", [(base + 300 * k,) for k in range(73)])
+        con.commit()
+        con.close()
+        folder = os.path.join(tmp, "reports")
+        path = sc.run_auto(wed_after, db, folder)
+        assert path and os.path.exists(path) and path.endswith("session_check_2026-11-25.txt")
+        text = open(path, encoding="utf-8").read()
+        assert "End-of-day check for Wed 25 Nov 2026" in text and "NIFTY 5m candles saved for the day: 73" in text
+        assert len(sent) == 1 and sent[0].startswith("End-of-day check, Wed 25 Nov 2026"), sent
+        assert "item(s) to check" in sent[0] and "SENSEX 5m candles saved" in sent[0], "problems are listed in the message"
+        assert sent[0].rstrip().endswith("session_check_2026-11-25.txt")
+        # never twice for the same day; --force repeats it
+        assert sc.run_auto(wed_after, db, folder) is None and len(sent) == 1
+        assert sc.run_auto(wed_after, db, folder, force=True) and len(sent) == 2
+        # a weekend after the last report: Friday is checked once, Saturday later does nothing new
+        sat = datetime(2026, 11, 28, 12, 0, tzinfo=IST)
+        assert sc.run_auto(sat, db, folder) and sc.run_auto(sat, db, folder) is None
+        # Telegram off or failing: the report is still written, nothing crashes
+        sc.tg.is_configured = lambda: False
+        assert sc.run_auto(datetime(2026, 11, 26, 16, 0, tzinfo=IST), db, folder) and len(sent) == 3
+        sc.tg.is_configured = lambda: True
+
+        def boom(text):
+            raise RuntimeError("no network")
+        sc.tg.send_message = boom
+        assert sc.run_auto(datetime(2026, 11, 30, 16, 0, tzinfo=IST), db, folder)
+
+    print("OK: trading day, data freshness, journal summary, saved-data and collection-run checks, automatic mode")
 
 
 if __name__ == "__main__":
