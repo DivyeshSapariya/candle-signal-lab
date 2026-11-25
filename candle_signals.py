@@ -48,6 +48,7 @@ VOLUME_AVG_CANDLES = 20
 VOLUME_MIN_RATIO = 1.0     # signal candle volume vs the recent average
 OI_PCR_SPLIT = 1.0          # put/call OI ratio: above = more puts written (supports CE), below supports PE
 OI_WALL_ATR = 1.0          # "just under / over a wall" = within 1 x ATR
+ROOM_MIN_R = 2.0           # "room" check: the nearest key level ahead must be at least this far (in R) = the target distance
 GAP_BIG_PCT = 0.3          # an opening gap bigger than this (in %) counts as a "big gap"
 ADX_MIN = 20
 MIN_SCORE = 3
@@ -79,6 +80,8 @@ DEFAULT_FILTERS = {
     "oi_pcr": False,
     "oi_wall": False,
     "oi_flow": False,
+    # "room": the target must not sit beyond the nearest key level ahead. OFF until judged (python strategy_lab.py --room-check)
+    "room": False,
 }
 
 FILTER_LABELS = {
@@ -96,6 +99,7 @@ FILTER_LABELS = {
     "oi_pcr": "Put/call open-interest ratio agrees",
     "oi_wall": "Not right under a call wall / over a put wall",
     "oi_flow": "Recent open-interest build-up agrees",
+    "room": "Room to the next key level (the target is not beyond it)",
 }
 
 
@@ -308,6 +312,36 @@ def _level_check(S, atr: float, side: str):
     return False, "is not at any key level"
 
 
+def _entry_stop_risk(flt: dict, S, C, side: str, atr: float):
+    """Entry price, the signal candle's extreme and the stop distance (kept between 0.25 and 1.5 ATR)."""
+    if flt["confirm"]:
+        entry = float(C["close"])
+        raw_stop = float(S["low"]) if side == "CE" else float(S["high"])
+    else:
+        entry = float(S["high"]) if side == "CE" else float(S["low"])
+        raw_stop = float(S["low"]) if side == "CE" else float(S["high"])
+    risk = abs(entry - raw_stop)
+    return entry, raw_stop, min(max(risk, MIN_RISK_ATR * atr), MAX_RISK_ATR * atr)
+
+
+def room_ahead(C, side: str, entry: float, risk: float):
+    """
+    The nearest opposing key level ahead of the entry: (distance in R, its name), or None when there is none.
+    CE: previous day high, opening range high, recent swing high. PE: previous day low, opening range low, swing low.
+    """
+    if risk <= 0:
+        return None
+    sign = 1 if side == "CE" else -1
+    named = ([("previous day high", C["pdh"]), ("opening range high", C["or_high"]), ("recent swing high", C["swing_high"])]
+             if side == "CE" else
+             [("previous day low", C["pdl"]), ("opening range low", C["or_low"]), ("recent swing low", C["swing_low"])])
+    ahead = [((lvl - entry) * sign, name) for name, lvl in named if pd.notna(lvl) and (lvl - entry) * sign > 0]
+    if not ahead:
+        return None
+    distance, name = min(ahead)
+    return distance / risk, name
+
+
 def _patterns_of(row) -> list:
     return [p for p in PATTERN_INFO if bool(row[p])]
 
@@ -435,6 +469,21 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
                     + (f"this trade goes against a big gap" if against else "no big gap against this trade"),
             "ok": not against, "required": True})
 
+    # --- room to the next key level (off by default) ---
+    entry, raw_stop, risk = _entry_stop_risk(flt, S, C, side, atr)
+    if flt["room"]:
+        ahead_info = room_ahead(C, side, entry, risk)
+        if ahead_info is None:
+            reasons.append({"key": "room", "text": "No key level between the entry and the target", "ok": True, "required": True})
+        else:
+            room, name = ahead_info
+            ok = room >= ROOM_MIN_R
+            reasons.append({
+                "key": "room",
+                "text": (f"The {name} is {room:.1f} R ahead: room for the target" if ok else
+                         f"The {name} is only {room:.1f} R ahead, before the {ROOM_MIN_R:g} R target"),
+                "ok": ok, "required": True})
+
     # --- open-interest checks (off by default; skipped when there is no OI for this candle) ---
     if flt["oi_pcr"] and pd.notna(C["oi_pcr"]):
         ok = bool(C["oi_pcr"] >= OI_PCR_SPLIT) if side == "CE" else bool(C["oi_pcr"] <= OI_PCR_SPLIT)
@@ -482,15 +531,7 @@ def evaluate(f: pd.DataFrame, i: int, index: str, interval_min: int, filters: di
     if score < MIN_SCORE:
         return _none("Pattern found, but not enough things agree. Wait.", reasons, score)
 
-    # --- levels: entry, stop loss, target ---
-    if flt["confirm"]:
-        entry = float(C["close"])
-        raw_stop = float(S["low"]) if side == "CE" else float(S["high"])
-    else:
-        entry = float(S["high"]) if side == "CE" else float(S["low"])
-        raw_stop = float(S["low"]) if side == "CE" else float(S["high"])
-    risk = abs(entry - raw_stop)
-    risk = min(max(risk, MIN_RISK_ATR * atr), MAX_RISK_ATR * atr)
+    # --- levels: entry, stop loss, target (entry and risk were worked out above) ---
     stop = entry - sign * risk
     target = entry + sign * REWARD_TO_RISK * risk
     step = STRIKE_STEP[index]

@@ -18,6 +18,17 @@ are never tuned afterwards (tuning on the same data is how you fool yourself).
 
 Same trade simulation, costs, trading hours and one-trade-at-a-time rule as the main backtest.
 
+THE ROOM-CHECK EXPERIMENT (python strategy_lab.py --room-check)
+  Question: should an idea be skipped when a key level sits between the entry and its 2 R target? Written down before
+  looking at any result: "room" = distance to the nearest opposing key level ahead (CE: previous day high, opening
+  range high, recent swing high; PE: the low versions), in units of the stop distance. The check passes when there is
+  no level ahead or the level is at least 2.0 R away (the target distance). The threshold and the levels are fixed.
+  Two questions per market and pooled:
+     a) Does it discriminate? Average result of the trades it keeps minus the ones it removes, with a 95% bootstrap range.
+     b) Do the rules WITH the check pass the same gate as everything else (section above)?
+  The check is only a candidate if the pooled difference is clearly above 0 (95% range above 0) AND the rules with the
+  check have a better average than without it in at least 3 of the 4 markets. Even then it must pass the gate before use.
+
 THE SHORT-TARGET EXPERIMENT (python strategy_lab.py --short-targets)
   Same entries and stops as the CURRENT candle-pattern rules (default filters), but a smaller target, written down
   before looking at any result and never tuned:
@@ -400,6 +411,93 @@ def judge_short(f, index, interval, variant, runs, entries, seed=11):
     return res
 
 
+# ---------------------------------------------------------------------------
+# The room-check experiment
+# ---------------------------------------------------------------------------
+def diff_range(kept, removed, runs=5000, seed=7):
+    """Mean(kept) - mean(removed) and its 95% bootstrap range (each group resampled on its own). None if too few trades."""
+    if len(kept) < 5 or len(removed) < 5:
+        return None
+    rng = np.random.default_rng(seed)
+    kept, removed = np.asarray(kept), np.asarray(removed)
+    a = rng.choice(kept, size=(runs, len(kept)), replace=True).mean(axis=1)
+    b = rng.choice(removed, size=(runs, len(removed)), replace=True).mean(axis=1)
+    d = a - b
+    return float(kept.mean() - removed.mean()), float(np.percentile(d, 2.5)), float(np.percentile(d, 97.5))
+
+
+def room_split(f, index, interval_min):
+    """The current rules' trades, each with its room (R to the nearest key level ahead); room_ok = the check would keep it."""
+    base = bt.run_backtest(f, index, interval_min, None, cs.REWARD_TO_RISK, bt.COST_R)
+    out = []
+    for t in base:
+        row = f.loc[pd.Timestamp(t["time"])]
+        found = cs.room_ahead(row, t["side"], float(t["entry"]), abs(t["fill"] - t["stop"]))
+        room = None if found is None else found[0]
+        out.append({"r_net": t["r_net"], "target": t["status"] == "TARGET", "room": room,
+                    "room_ok": room is None or room >= cs.ROOM_MIN_R})
+    return out
+
+
+def judge_room(f, index, interval, runs):
+    """The rules WITH the room check, through the same gate as the strategies."""
+    im = INTERVAL_MINUTES[interval]
+    run = lambda a, z: bt.run_backtest(f, index, im, {"room": True}, cs.REWARD_TO_RISK, bt.COST_R, i_start=a, i_end=z)
+    return judge(f, index, interval, "room", runs, run=run, rr=cs.REWARD_TO_RISK)
+
+
+def room_check_main(a):
+    pooled_kept, pooled_removed, improved, markets = [], [], 0, 0
+    for index in ([a.index] if a.index else ["nifty", "sensex"]):
+        for interval in ([a.interval] if a.interval else ["5m", "15m"]):
+            df = candle_store.load_candles(index, interval, a.db)
+            if len(df) < 500:
+                print(f"{index.upper()} {interval}: not enough saved candles")
+                continue
+            fut = candle_store.load_futures(index, interval, a.db)
+            f = cs.compute_features(df, index, INTERVAL_MINUTES[interval], candle_store.load_vix(a.db),
+                                    fut if len(fut) else None)
+            if a.since:
+                f = f[f.index.date >= pd.Timestamp(a.since).date()]            # features were worked out on all the history
+                if len(pd.unique(f["day"])) < 12:
+                    print(f"\n{index.upper()} {interval}: only {len(pd.unique(f['day']))} trading days since {a.since}: too few to judge")
+                    continue
+            trades = room_split(f, index, INTERVAL_MINUTES[interval])
+            kept = [t["r_net"] for t in trades if t["room_ok"]]
+            removed = [t["r_net"] for t in trades if not t["room_ok"]]
+            pooled_kept += kept
+            pooled_removed += removed
+            res = judge_room(f, index, interval, a.runs)
+            base_avg = float(np.mean([t["r_net"] for t in trades])) if trades else float("nan")
+            markets += 1
+            print(f"\n{'=' * 96}\n{index.upper()} {interval}")
+            print(f"  current rules          : {len(trades):>3} trades, target hit {np.mean([t['target'] for t in trades]) * 100:>3.0f}%, avg {base_avg:+.3f} R")
+            print(f"  check keeps / removes  : {len(kept):>3} trades avg {np.mean(kept) if kept else float('nan'):+.3f} R  /  "
+                  f"{len(removed):>3} trades avg {np.mean(removed) if removed else float('nan'):+.3f} R")
+            d = diff_range(kept, removed)
+            print("  kept minus removed     : " + (f"{d[0]:+.3f} R (95%: {d[1]:+.3f}..{d[2]:+.3f})" if d else "too few trades"))
+            if res["avg"] is None:
+                print("  rules WITH the check   : no trades")
+                continue
+            lo, hi = res["ci"] if res["ci"] else (float("nan"), float("nan"))
+            bl = " ".join(f"{x:+.2f}" for _, x in res["blocks"])
+            print(f"  rules WITH the check   : {res['trades']:>3} trades, avg {res['avg']:+.3f} R (95%: {lo:+.2f}..{hi:+.2f}), "
+                  f"blocks [{bl}], p vs random {res['p']:.3f}")
+            print(f"                           GATE: {'PASS' if res['passed'] else 'fail'}{'' if res['passed'] else ' - ' + res['why']}")
+            improved += int(res["avg"] > base_avg)
+    if not markets:
+        return
+    d = diff_range(pooled_kept, pooled_removed)
+    print(f"\n{'=' * 96}\nPOOLED over {markets} markets (the markets share the same days, so these are not independent trades):")
+    print(f"  kept {len(pooled_kept)} trades avg {np.mean(pooled_kept):+.3f} R | removed {len(pooled_removed)} trades avg {np.mean(pooled_removed):+.3f} R")
+    if d:
+        print(f"  kept minus removed: {d[0]:+.3f} R (95%: {d[1]:+.3f}..{d[2]:+.3f})")
+    print(f"  the rules with the check beat the rules without it in {improved} of {markets} markets")
+    candidate = bool(d and d[1] > 0 and improved >= min(3, markets))
+    print("  VERDICT: " + ("a CANDIDATE (still has to pass the gate before it is used)" if candidate
+                            else "NOT a candidate: keep the check OFF"))
+
+
 def reference_row(f, index, interval):
     """The current candle-pattern rules, for comparison (same data, same costs)."""
     t = bt.run_backtest(f, index, INTERVAL_MINUTES[interval])
@@ -412,6 +510,10 @@ def main():
     ap.add_argument("--index", choices=["nifty", "sensex"])
     ap.add_argument("--interval", choices=["5m", "15m"])
     ap.add_argument("--strategy", choices=list(STRATEGIES))
+    ap.add_argument("--room-check", action="store_true",
+                    help="test the optional 'room to the next key level' check on the current rules")
+    ap.add_argument("--since", help="with --room-check: only trades from this date on, YYYY-MM-DD "
+                                    "(the check was first judged on data up to 2026-11-25, so use --since 2026-11-26 for a fair test)")
     ap.add_argument("--short-targets", action="store_true",
                     help="run the short-target experiment (today's entries, smaller targets) instead of the four strategies")
     ap.add_argument("--variant", choices=list(SHORT_TARGETS), help="with --short-targets: only this variant")
@@ -419,6 +521,9 @@ def main():
     ap.add_argument("--db", default=candle_store.DB_FILE)
     a = ap.parse_args()
 
+    if a.room_check:
+        room_check_main(a)
+        return
     results = []
     for index in ([a.index] if a.index else ["nifty", "sensex"]):
         for interval in ([a.interval] if a.interval else ["5m", "15m"]):

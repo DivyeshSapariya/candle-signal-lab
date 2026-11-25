@@ -141,7 +141,7 @@ def report(index: str, interval: str, db: str):
 
     print("\n5) EXTRA CHECKS (default rules + one extra check; VWAP is already inside the default rules)")
     print("  ", one_line("Default rules", stats(t01, REWARD_TO_RISK, COST_R)))
-    for name in ("volume", "gap"):
+    for name in ("volume", "gap", "room"):
         if name == "volume" and not f["vol_ratio"].notna().any():
             print(f"   {FILTER_LABELS[name][:44]:<44} not available: no futures volume saved")
             continue

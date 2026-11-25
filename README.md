@@ -43,6 +43,7 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `session_check.py` | A read-only end-of-day check: trading day, fresh data, the day's ideas and alerts, what was saved, your settings. It runs by itself after the 16:00 collection and sends you a summary (section 3d). |
 | `test_holidays.py`, `test_risk_limits.py`, `test_session_check.py` | Tests for the three items above. |
 | `test_speed.py` | Checks the first-load speed-ups with fake Angel One calls: page requests go first, slow refreshes never block the page, Refresh waits for fresh numbers, the alert loop looks once per candle. |
+| `test_room_check.py` | Checks the `room` check: the distance maths, the check inside the rules (off by default, same entry and stop), no look-ahead, and the experiment's statistics. |
 | `test_alert_markets.py` | Checks that new-idea alerts go only to the markets in `ALERT_MARKETS`, and that other markets are saved without an alert (and so get no result alert). |
 | `test_waiting_ideas.py` | Checks that waiting ideas of markets nobody is looking at are settled once per candle, with one result alert and no new ideas. |
 | `test_late_trade.py` | Checks that a late-day trade is closed at the day's last candle even without a 15:25 candle, and that a running session stays open. |
@@ -96,8 +97,9 @@ Tip: you do not have to activate the environment. You can also run any command w
 | Telegram: check the settings / send a test message / find the group id | `python telegram_notify.py --check` / `--test` / `--find-chat` |
 | Test the Telegram alerts (no real bot needed) | `python test_telegram_notify.py` |
 | End-of-day check (runs by itself after 16:00; by hand if you want) | `python session_check.py` (options `--date YYYY-MM-DD`, `--no-live`, `--auto`, `--force`) |
+| Test the `room` check on the current rules (section 7f) | `python strategy_lab.py --room-check` (options `--index`, `--interval`, `--since YYYY-MM-DD`, `--runs`) |
 | Test smaller targets on the current rules' entries (section 7e) | `python strategy_lab.py --short-targets` (options `--index`, `--interval`, `--variant r0.5\|r1.0\|rs10\|rs20\|pct30\|pct50`, `--runs`) |
-| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_candle_chain.py`, `python test_oi_filters.py`, `python test_strategy_lab.py`, `python test_holidays.py`, `python test_risk_limits.py`, `python test_session_check.py`, `python test_late_trade.py`, `python test_speed.py`, `python test_waiting_ideas.py`, `python test_alert_markets.py` |
+| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_candle_chain.py`, `python test_oi_filters.py`, `python test_strategy_lab.py`, `python test_holidays.py`, `python test_risk_limits.py`, `python test_session_check.py`, `python test_late_trade.py`, `python test_speed.py`, `python test_waiting_ideas.py`, `python test_alert_markets.py`, `python test_room_check.py` |
 
 Stop any of them with **Ctrl + C**.
 
@@ -380,6 +382,7 @@ Think of a doctor: he does not diagnose from one symptom. He checks several test
 | `oi_pcr` | Put/call open-interest ratio above 1.0 for a CE, below 1.0 for a PE. | Off. Research only: not enough OI history. |
 | `oi_wall` | No CE when the price is within 1 ATR under the call wall (most call OI); no PE within 1 ATR over the put wall. | Off. Research only. |
 | `oi_flow` | In the last 30 minutes put OI built up more than call OI for a CE, less for a PE. | Off. Research only. |
+| `room` | **Room to the next key level.** Skip an idea when a key level sits between the entry and its 2 R target: the nearest opposing level ahead (CE: previous day high, opening range high, recent swing high; PE: the low versions) must be at least 2.0 R (the target distance) away, or there is none. | Off. A candidate, not proven (section 7f). Works in the live page and in backtests. |
 
 The three `oi_*` checks use the saved option-chain history (section 3b), with fixed untuned thresholds. A candle uses only OI bars that had finished before it closed, and a candle with no recent OI (older than 20 minutes, or fewer than 6 strikes per side) simply skips the check. **They do nothing in the live dashboard**, which does not compute these features: switching one on in `DEFAULT_FILTERS` only affects research and backtests that pass the saved option table to `compute_features(..., chain=load_option_chain(index))`.
 
@@ -556,6 +559,28 @@ What it shows:
 - **A rupee target means a different size on each market.** The average Rs 10 target is about 0.78 R on NIFTY 5m but only 0.14 to 0.24 R on SENSEX, because the same Rs 10 needs a much smaller index move relative to the stop. A 0.14 R target hit 87% of the time still loses 0.10 R, because the 0.1 R cost is bigger than the average gain. Very small targets cannot pay their costs unless nearly every trade wins.
 - **The best-looking cells are the 15m results around zero** (`r1.0`: +0.05 NIFTY, +0.03 SENSEX; `rs20` and `pct30` on NIFTY: +0.04). Their 95% ranges include zero, they do not beat random entries at p < 0.01 (the closest are p = 0.06 and 0.057), and there are 24 tests, so they are noise until proven otherwise.
 - **Conclusion:** a smaller target on these entries does not create an edge. What is missing is the prediction, not the target size. The option variants are also a little optimistic (no time decay after the entry). Re-run it as the data grows: `python strategy_lab.py --short-targets`.
+
+---
+
+## 7f. The "room to the next key level" check (`python strategy_lab.py --room-check`)
+
+Question (raised by a losing SENSEX 84400 CE idea on 25 Nov 2026, whose 2 R target sat just beyond the previous day's high): should an idea be skipped when a key level lies between the entry and its target? The rule was written down before this test and is not tuned: the nearest opposing level ahead (previous day high / opening range high / recent swing high for a CE, the low versions for a PE) must be at least 2.0 R away, or there must be none. It is the optional check `room` (off by default).
+
+**Result on the one-year data (current rules, 2 R target, 0.1 R cost):**
+
+| Market | Current rules | Check keeps | Check removes | Kept minus removed (95% range) | Rules WITH the check | Gate |
+|---|---|---|---|---|---|---|
+| NIFTY 5m | 185 trades, -0.12 R | 65 trades, +0.26 R | 120 trades, -0.33 R | +0.58 (+0.19 to +0.99) | 81 trades, +0.08 R | fail |
+| NIFTY 15m | 80 trades, -0.03 R | 32 trades, -0.02 R | 48 trades, -0.04 R | +0.02 (-0.43 to +0.46) | 35 trades, +0.03 R | fail |
+| SENSEX 5m | 197 trades, -0.06 R | 80 trades, +0.15 R | 117 trades, -0.19 R | +0.34 (-0.04 to +0.71) | 94 trades, +0.07 R | fail |
+| SENSEX 15m | 85 trades, +0.06 R | 36 trades, +0.06 R | 49 trades, +0.05 R | +0.00 (-0.44 to +0.43) | 38 trades, +0.03 R | fail |
+| **Pooled** | | 213 trades, +0.14 R | 334 trades, -0.18 R | **+0.32 (+0.11 to +0.54)** | better in 3 of 4 markets | |
+
+**Verdict: a candidate, not a result.** The trades the check removes lose clearly more than the ones it keeps (pooled, the range is above zero), and the rules with the check have a better average in 3 of 4 markets. But:
+- **No market passes the gate.** Every 95% range for the rules with the check includes zero, none beats random entries (p between 0.10 and 0.23), and only 1 to 2 of 4 blocks are positive. The check also leaves only 35 to 94 trades per market, which is too few.
+- **The effect is all on 5-minute candles.** On 15-minute candles the kept and removed trades are the same (+0.02 and +0.00).
+- **It is not an out-of-sample test.** The idea came from looking at this same year of data (the buckets of trades by room, in the loss analysis), so this confirms what was already seen. NIFTY and SENSEX share the same days, so the pooled trades are not independent.
+- **Keep it OFF.** To judge it fairly, wait for new data and run `python strategy_lab.py --room-check --since 2026-11-26` after a few months (it needs at least 12 trading days of new data per market, and many more to say anything). Only if it then holds, with the rules passing the gate, should it be switched on.
 
 ---
 
