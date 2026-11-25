@@ -246,7 +246,11 @@ TARGET - ₹212.40
 Per unit:
 loss - ₹13.00
 profit - ₹27.70
+
+Next level - previous day high 25,663 (233 pts, 1.9 R ahead, before the 2 R target)
 ```
+
+The last line is the nearest key level in the way (previous day, opening range or recent swing), with its distance; "before the 2 R target" appears when the level lies before the target, and "none before the target" when nothing is in the way. It is information only; no rule uses it.
 
 **When it ends** (✅ target hit, ❌ stop loss hit, ⏱ time exit):
 

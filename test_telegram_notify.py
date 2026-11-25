@@ -106,6 +106,15 @@ def test_messages():
                 f"profit - {rupee}27.85")
     assert text == expected, "the idea message must be exactly the compact format:\n" + text
     assert len(text.splitlines()) == 11, "the idea message must stay short"
+    # an idea that carries its nearest key level gets ONE extra line at the end; one without it stays as above
+    near = dict(sample_idea(), context={"room": {"name": "previous day high", "price": 25662.96, "points": 232.6, "r": 1.86}})
+    with_near = tg.format_idea(near, sample_levels(), index="nifty", interval="5m")
+    assert with_near == expected + "\n\nNext level - previous day high 25,663 (233 pts, 1.9 R ahead, before the 2 R target)", with_near
+    far = dict(sample_idea(), context={"room": {"name": "recent swing high", "price": 25900.0, "points": 469.6, "r": 3.4}})
+    assert tg.format_idea(far, sample_levels(), index="nifty", interval="5m").endswith("Next level - recent swing high 25,900 (470 pts, 3.4 R ahead)")
+    nothing = dict(sample_idea(), context={"room": None})
+    assert tg.format_idea(nothing, sample_levels(), index="nifty", interval="5m").endswith("\n\nNext level - none before the target")
+    assert tg.format_idea(near, None, index="nifty", interval="5m").endswith("1.9 R ahead, before the 2 R target)"), "also without option prices"
     late = tg.format_idea(sample_idea(), sample_levels(), delayed_min=17, index="nifty", interval="5m")
     assert "DELAYED DATA: about 17 min old" in late and "BUY - " in late
     plain = tg.format_idea(sample_idea(), None, index="nifty", interval="5m")     # no option prices

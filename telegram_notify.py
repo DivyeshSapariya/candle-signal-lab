@@ -176,6 +176,21 @@ def _clock(iso_text) -> str:
         return ""
 
 
+def _next_level_line(idea: dict) -> str:
+    """One line about the nearest key level in the way (empty when the idea carries no such information)."""
+    context = idea.get("context")
+    if context is None:
+        return ""
+    room = context.get("room")
+    if not room:
+        return "Next level - none before the target"
+    from candle_signals import REWARD_TO_RISK                       # imported here: this module otherwise needs nothing from the rules
+    text = f"Next level - {room['name']} {float(room['price']):,.0f} ({float(room['points']):.0f} pts, {float(room['r']):.1f} R ahead"
+    if float(room["r"]) < REWARD_TO_RISK:
+        text += f", before the {REWARD_TO_RISK:g} R target"
+    return text + ")"
+
+
 def format_idea(idea: dict, option_levels: dict = None, memory: dict = None, setup: str = "",
                 index: str = "", interval: str = "", status: str = "", delayed_min=None) -> str:
     """
@@ -209,6 +224,9 @@ def format_idea(idea: dict, option_levels: dict = None, memory: dict = None, set
         lines += [f"BUY - {_num(idea['entry'])} (index)",
                   f"STOP LOSS - {_num(idea['stop'])} (index)",
                   f"TARGET - {_num(idea['target'])} (index)"]
+    nxt = _next_level_line(idea)
+    if nxt:
+        lines += ["", nxt]
     return "\n".join(lines)
 
 
