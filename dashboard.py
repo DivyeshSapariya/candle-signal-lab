@@ -32,6 +32,7 @@ import telegram_notify as tg
 from candle_patterns import PATTERN_INFO
 from data_sources import (IST, INTERVAL_MINUTES, angel_futures, angel_option_contracts, angel_too_fast, drop_forming_candle,
                           fetch_angel_future, fetch_angel_option, fetch_angel_option_oi, get_candles, option_lot_size)
+import data_sources
 from option_pricer import build_option_levels, get_vix_daily, is_holiday
 from candle_analysis import live_analysis, rejected_setups
 import candle_chain
@@ -56,6 +57,8 @@ def default_source() -> str:
     return "angel" if all(os.environ.get(k) for k in ANGEL_KEYS) else "yahoo"
 
 
+JOIN_WAIT_SECONDS = 4.0                   # how long a page poll waits for a fresh build before showing the last copy
+SERVE_STALE_SECONDS = 600                 # the last copy may be shown for this long while a fresh one is built
 STALE_SECONDS = 300                       # if the data source fails, show the last good data for up to 5 minutes
 CACHE_SECONDS = 10                        # do not call the data source more than every 10s
 _cache = {}
@@ -70,20 +73,46 @@ def chart_time(ts) -> int:
     return int(ts.timestamp()) + IST_OFFSET_SECONDS
 
 
+_inflight = {}
+_inflight_guard = threading.Lock()
+
+
+def _spawn_once(key, fn, background: bool = False):
+    """
+    Run fn() in a background thread, but only ONE thread per key at a time (a second call returns the
+    thread that is already running). background=True makes its Angel One calls low priority.
+    """
+    with _inflight_guard:
+        running = _inflight.get(key)
+        if running is not None and running.is_alive():
+            return running
+
+        def work():
+            try:
+                if background:
+                    with data_sources.background_requests():
+                        fn()
+                else:
+                    fn()
+            except Exception as error:
+                print(f"[background] {key}: {error}")
+            finally:
+                with _inflight_guard:
+                    _inflight.pop(key, None)
+
+        thread = threading.Thread(target=work, name=f"refresh-{key[0]}", daemon=True)
+        _inflight[key] = thread
+        thread.start()
+        return thread
+
+
 _future_cache = {}
 FUTURE_CACHE_SECONDS = 60
+FUTURE_STALE_SECONDS = 600    # an older copy may be shown while a fresh one is fetched in the background
 FUTURE_DAYS = 6               # enough candles for the 20-candle volume average
 
 
-def _live_futures(index: str, interval: str):
-    """
-    Recent candles of the nearest index future (real volume), only with Angel One. Cached for a
-    minute. Returns None when it cannot be fetched: the VWAP then falls back to the day's average price.
-    """
-    key = (index, interval)
-    cached = _future_cache.get(key)
-    if cached and time.time() - cached[0] < FUTURE_CACHE_SECONDS:
-        return cached[1]
+def _fetch_futures(index: str, interval: str):
     try:
         contract = angel_futures(index)[0]
         now = datetime.now(IST)
@@ -91,12 +120,29 @@ def _live_futures(index: str, interval: str):
     except Exception as error:
         print(f"[futures] volume not available: {error}")
         df = None
-    _future_cache[key] = (time.time(), df)
+    _future_cache[(index, interval)] = (time.time(), df)
     return df
 
 
+def _live_futures(index: str, interval: str):
+    """
+    Recent candles of the nearest index future (real volume), only with Angel One. Cached for a minute;
+    after that the old copy is used at once while a fresh one is fetched in the background (only the very
+    first fetch waits). Returns None when it cannot be fetched: the VWAP then falls back to the day's average price.
+    """
+    key = (index, interval)
+    cached = _future_cache.get(key)
+    age = time.time() - cached[0] if cached else None
+    if cached and age < FUTURE_CACHE_SECONDS:
+        return cached[1]
+    if cached and cached[1] is not None and age < FUTURE_STALE_SECONDS:
+        _spawn_once(("futures", key), lambda: _fetch_futures(index, interval), background=True)
+        return cached[1]
+    return _fetch_futures(index, interval)
+
+
 _chain_cache = {}
-CHAIN_CACHE_SECONDS = 60
+CHAIN_CACHE_SECONDS = 120
 
 
 def _option_chain(source: str, index: str, spot: float):
@@ -104,18 +150,30 @@ def _option_chain(source: str, index: str, spot: float):
     Open-interest facts for the card. With Angel One: the CURRENT OI of the contracts around the index
     level (one read-only request, cached for a minute), compared with the last saved session. Otherwise,
     or if that fails: the last saved day (python candle_store.py backfill-options). None when nothing exists.
+    The card never makes the page wait: the live numbers are fetched in the background, and until they
+    arrive the old copy (or, the very first time, the last saved day) is shown.
     """
     key = (source, index)
     cached = _chain_cache.get(key)
     if cached and time.time() - cached[0] < CHAIN_CACHE_SECONDS:
         return cached[1]
+    if source != "angel":
+        return _chain_compute(source, index, spot)
+    _spawn_once(("chain", key), lambda: _chain_compute(source, index, spot), background=True)
+    if cached:
+        return cached[1]
+    return _chain_compute(source, index, spot, live=False, store=False)
+
+
+def _chain_compute(source: str, index: str, spot: float, live: bool = True, store: bool = True):
+    key = (source, index)
     result = None
     try:
         saved = candle_store.load_option_chain(index)
     except Exception as error:
         print(f"[chain] saved data not readable: {error}")
         saved = None
-    if source == "angel":
+    if source == "angel" and live:
         try:
             contracts = angel_option_contracts(index, spot)
             oi, traded = fetch_angel_option_oi(contracts)
@@ -130,19 +188,27 @@ def _option_chain(source: str, index: str, spot: float):
         if snap:
             expiry, current, before, day = snap
             result = candle_chain.summarize(current, before, spot, expiry, "saved", day)
-    _chain_cache[key] = (time.time(), result)
+    if store:
+        _chain_cache[key] = (time.time(), result)
     return result
 
 
 def build_payload(source: str, index: str, interval: str) -> dict:
+    started = time.time()
     full = get_candles(source, index, interval, include_forming=True)
+    t_candles = time.time() - started
     finished = drop_forming_candle(full, interval)
     if len(finished) < 5:
         raise RuntimeError("Not enough finished candles yet. Try again in a few minutes.")
 
     interval_min = INTERVAL_MINUTES[interval]
+    t_mark = time.time()
     fut = _live_futures(index, interval) if source == "angel" else None
-    analysed = compute_features(finished, index, interval_min, get_vix_daily(), fut)
+    t_futures = time.time() - t_mark
+    t_mark = time.time()
+    vix_daily = get_vix_daily()
+    t_vix = time.time() - t_mark
+    analysed = compute_features(finished, index, interval_min, vix_daily, fut)
     pattern_cols = list(PATTERN_INFO.keys())
 
     # --- candles for the chart (includes the running candle) ---
@@ -255,11 +321,13 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         print(f"[analysis] problem: {error}")
         analysis = None
 
+    t_mark = time.time()
     try:
         chain = _option_chain(source, index, current_price)
     except Exception as error:                          # a side card must never break the dashboard
         print(f"[chain] problem: {error}")
         chain = None
+    t_chain = time.time() - t_mark
 
     risk_cfg = risk_limits.settings()
     try:
@@ -354,6 +422,9 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         "plan": plan,
         "analysis": analysis,
         "chain": chain,
+        "timing": {"candles": round(t_candles, 2), "futures": round(t_futures, 2),
+                   "vix": round(t_vix, 2), "chain": round(t_chain, 2), "total": round(time.time() - started, 2),
+                   "angel": dict(data_sources.angel_stats, recent=list(data_sources.angel_recent[-14:]))},
         "risk": risk,
         "journal": journal_summary,
         "last_price": current_price,
@@ -414,6 +485,17 @@ def api_data():
     cached = _cache.get(key)
     if cached and time.time() - cached[0] < CACHE_SECONDS:
         return jsonify(cached[1])
+
+    # A routine poll never waits long: if the fresh build is not ready in a few seconds (Angel One calls are
+    # queued), the last copy is shown at once and the next poll gets the new one. The Refresh button and a
+    # change of market (?fresh=1) always wait for fresh numbers.
+    if cached and request.args.get("fresh") != "1" and time.time() - cached[0] < SERVE_STALE_SECONDS:
+        worker = _spawn_once(("payload", key), lambda: _fresh_payload(source, index, interval))
+        worker.join(JOIN_WAIT_SECONDS)
+        newest = _cache.get(key)
+        if newest and newest[0] > cached[0]:
+            return jsonify(newest[1])
+        return jsonify({**cached[1], "refreshing": True})
 
     try:
         payload = _fresh_payload(source, index, interval)
@@ -509,6 +591,28 @@ def _alert_markets() -> list:
     return found or [("nifty", "5m"), ("sensex", "5m")]
 
 
+ALERT_CANDLE_GRACE_SECONDS = 10       # after the close, one look this long after 3:30 pm is enough
+
+
+def _candle_already_seen(cached, interval_min: int, now: datetime) -> bool:
+    """
+    True when the cached build (built_at, payload) already includes the candle that closed most recently.
+    The alert loop needs a market only once per candle (an idea can only appear when a candle closes), which
+    keeps its Angel One calls few: Angel One refuses requests when there are many. If the data source is
+    late with the new candle, the answer stays False and the next tick looks again.
+    """
+    built_at, payload = cached
+    close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    if now >= close:
+        return built_at >= close.timestamp() + ALERT_CANDLE_GRACE_SECONDS      # after the close one look is enough
+    boundary = now.replace(minute=(now.minute // interval_min) * interval_min if interval_min < 60 else 0,
+                           second=0, microsecond=0)
+    if built_at < boundary.timestamp():
+        return False                                                           # built before this candle closed
+    expected = (boundary - timedelta(minutes=interval_min)).strftime("%d %b %H:%M")
+    return (payload.get("latest") or {}).get("time") == expected
+
+
 def _alert_tick(source: str = None, markets: list = None) -> int:
     """
     One look at every watched market. Runs only on weekdays from 9:10 to 16:00 IST (the last
@@ -525,6 +629,8 @@ def _alert_tick(source: str = None, markets: list = None) -> int:
         cached = _cache.get(key)
         if cached and time.time() - cached[0] < CACHE_SECONDS:
             continue                                   # a browser tab just looked at it
+        if cached and _candle_already_seen(cached, INTERVAL_MINUTES[interval], now):
+            continue                                   # nothing new can have happened since the last candle closed
         try:
             _fresh_payload(source, index, interval)
             checked += 1
@@ -534,12 +640,13 @@ def _alert_tick(source: str = None, markets: list = None) -> int:
 
 
 def _alert_loop() -> None:
-    while True:
-        try:
-            _alert_tick()
-        except Exception as error:
-            print(f"[alerts] problem: {error}")
-        time.sleep(ALERT_POLL_SECONDS)
+    with data_sources.background_requests():              # this thread's Angel One calls wait for page requests
+        while True:
+            try:
+                _alert_tick()
+            except Exception as error:
+                print(f"[alerts] problem: {error}")
+            time.sleep(ALERT_POLL_SECONDS)
 
 
 def start_alert_loop() -> threading.Thread:
@@ -1321,12 +1428,12 @@ function syncControls() {
 function setState(key, value) {
   if (state[key] === value) return;
   state[key] = value; store.set('cs.' + key, value);
-  needFit = true; syncControls(); load();
+  needFit = true; syncControls(); load(true);
 }
 document.querySelectorAll('#indexSeg button').forEach((b) => b.addEventListener('click', () => setState('index', b.dataset.v)));
 document.querySelectorAll('#intervalSeg button').forEach((b) => b.addEventListener('click', () => setState('interval', b.dataset.v)));
 $('source').addEventListener('change', (e) => setState('source', e.target.value));
-$('refresh').addEventListener('click', load);
+$('refresh').addEventListener('click', () => load(true));
 $('themeBtn').addEventListener('click', () => applyTheme(theme === 'dark' ? 'light' : 'dark'));
 $('errorClose').addEventListener('click', () => $('error').classList.remove('show'));
 $('resetView').addEventListener('click', () => { fitRecent(); });
@@ -1684,7 +1791,7 @@ function render(d) {
   if (d.delayed) { pd.className = 'pill warn'; $('pDataText').textContent = 'Data ~' + d.data_lag_min + ' min old'; }
   else if (d.market_open) { pd.className = 'pill ok'; $('pDataText').textContent = 'Data up to date'; }
   else { pd.className = 'pill'; $('pDataText').textContent = 'Last session ' + d.newest_candle; }
-  $('updated').textContent = 'Updated ' + d.updated + (d.candle_running ? ' \u00B7 candle running' : '');
+  $('updated').textContent = 'Updated ' + d.updated + (d.candle_running ? ' \u00B7 candle running' : '') + (d.refreshing ? ' \u00B7 refreshing' : '');
 
   renderDecision(d);
   renderAnalysis(d);
@@ -1866,10 +1973,11 @@ document.querySelectorAll('#histChips .chip').forEach((b) => b.addEventListener(
 
 // ---------------- loading ----------------
 let loading = false;
-async function load() {
+async function load(manual) {
   if (loading) return;
   loading = true;
   const params = new URLSearchParams({ index: state.index, interval: state.interval, source: state.source });
+  if (manual === true) params.set('fresh', '1');
   try {
     const res = await fetch('/api/data?' + params.toString());
     const d = await res.json();

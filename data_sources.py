@@ -131,6 +131,26 @@ ANGEL_CALL_GAP_SECONDS = 2.0        # Angel One refuses requests that come too f
 ANGEL_RETRY_WAITS = (3, 6, 12)      # seconds to wait before each retry after "exceeding access rate"
 _angel_last_call = [0.0]
 _angel_lock = threading.RLock()     # the dashboard serves several requests at once; Angel One must see ONE at a time
+# Requests made for a page you are looking at go before background ones (the alert loop, refreshes that only
+# top up a cache). A background request waits while a page request is queued, but never longer than the limit below.
+BACKGROUND_MAX_WAIT_SECONDS = 10.0
+_angel_priority = threading.local()
+# counters for diagnosing slowness (shown in the page data as "timing")
+angel_stats = {"calls": 0, "rate_limited": 0, "wait_seconds": 0.0}
+angel_recent = []                      # the last calls: [clock time, outcome, seconds the call took, thread kind]
+_angel_page_waiting = [0]
+_angel_waiting_guard = threading.Lock()
+
+
+class background_requests:
+    """with background_requests(): ...   marks the Angel One calls made by this thread as low priority."""
+
+    def __enter__(self):
+        self._before = getattr(_angel_priority, "low", False)
+        _angel_priority.low = True
+
+    def __exit__(self, *exc):
+        _angel_priority.low = self._before
 
 
 def angel_too_fast(res=None, error=None) -> bool:
@@ -149,24 +169,47 @@ def _angel_request(call):
     """
     import time
 
-    with _angel_lock:
-        for attempt in range(len(ANGEL_RETRY_WAITS) + 1):
-            wait = ANGEL_CALL_GAP_SECONDS - (time.time() - _angel_last_call[0])
-            if wait > 0:
-                time.sleep(wait)
-            _angel_last_call[0] = time.time()
-            try:
-                res = call()
-                if not angel_too_fast(res=res):
-                    return res
-                error = RuntimeError(str(res))
-            except Exception as raised:
-                error = raised
-                if not angel_too_fast(error=raised):
-                    raise
-            if attempt == len(ANGEL_RETRY_WAITS):
-                raise error
-            time.sleep(ANGEL_RETRY_WAITS[attempt])
+    entered = time.time()
+    low = getattr(_angel_priority, "low", False)
+    if low:
+        give_up = time.time() + BACKGROUND_MAX_WAIT_SECONDS
+        while _angel_page_waiting[0] > 0 and time.time() < give_up:
+            time.sleep(0.1)                               # a page request is queued: let it go first
+    else:
+        with _angel_waiting_guard:
+            _angel_page_waiting[0] += 1
+    try:
+        with _angel_lock:
+            waits = ANGEL_RETRY_WAITS[:1] if low else ANGEL_RETRY_WAITS     # background work gives up early and tries again later
+            for attempt in range(len(waits) + 1):
+                wait = ANGEL_CALL_GAP_SECONDS - (time.time() - _angel_last_call[0])
+                if wait > 0:
+                    time.sleep(wait)
+                _angel_last_call[0] = time.time()
+                angel_stats["calls"] += 1
+                began = time.time()
+                try:
+                    res = call()
+                    if not angel_too_fast(res=res):
+                        angel_recent.append([round(began % 1000, 1), "ok", round(time.time() - began, 2), "bg" if low else "page"])
+                        del angel_recent[:-40]
+                        return res
+                    error = RuntimeError(str(res))
+                except Exception as raised:
+                    error = raised
+                    if not angel_too_fast(error=raised):
+                        raise
+                angel_recent.append([round(began % 1000, 1), "LIMITED", round(time.time() - began, 2), "bg" if low else "page"])
+                del angel_recent[:-40]
+                angel_stats["rate_limited"] += 1
+                if attempt == len(waits):
+                    raise error
+                time.sleep(waits[attempt])
+    finally:
+        angel_stats["wait_seconds"] += time.time() - entered
+        if not low:
+            with _angel_waiting_guard:
+                _angel_page_waiting[0] -= 1
 
 
 def _angel_get_candles(client, params: dict):

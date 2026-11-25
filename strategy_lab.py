@@ -18,6 +18,18 @@ are never tuned afterwards (tuning on the same data is how you fool yourself).
 
 Same trade simulation, costs, trading hours and one-trade-at-a-time rule as the main backtest.
 
+THE SHORT-TARGET EXPERIMENT (python strategy_lab.py --short-targets)
+  Same entries and stops as the CURRENT candle-pattern rules (default filters), but a smaller target, written down
+  before looking at any result and never tuned:
+     r0.5, r1.0     the target is 0.5 / 1.0 times the stop distance on the index (today it is 2.0)
+     rs10, rs20     the target is where an at-the-money option has gained Rs 10 / Rs 20 per share
+     pct30, pct50   the target is where an at-the-money option has gained 30% / 50% of its price
+  The option variants turn the gain into an index distance with Black-Scholes (the option's price at entry from the
+  previous day's India VIX and the time to the nearest weekly expiry). That distance divided by the stop distance is
+  the reward : risk of that trade (kept between 0.1 and 6). Time decay after the entry is NOT included, so these
+  variants are a little EASIER than reality. Random entries with the same stops and the same reward : risk pairs are
+  the baseline, and the same gate applies (so a short target must prove itself like anything else).
+
 THE GATE (a strategy counts as a real candidate only if ALL are true, for that market and candle size)
   - at least 60 trades in the year
   - average result above 0 after a 0.1 R cost
@@ -40,6 +52,7 @@ import candle_backtest as bt
 import candle_research as rs
 import candle_signals as cs
 import candle_store
+import option_pricer as op
 from data_sources import INTERVAL_MINUTES
 
 warnings.simplefilter("ignore")
@@ -174,9 +187,15 @@ def run_strategy(f, interval_min, name, cost_r=bt.COST_R, i_start=30, i_end=None
 # Random entries with the same stops, reward : risk and number of trades
 # ---------------------------------------------------------------------------
 def random_baseline(f, interval_min, trades, rr, runs, seed, cost_r=bt.COST_R):
-    """Average net R of `runs` random-entry sets (random candle, random side) shaped like the strategy."""
+    """
+    Average net R of `runs` random-entry sets (random candle, random side) shaped like the strategy.
+    rr=None: every trade has its own reward : risk (trade["rr"]); each random entry copies the stop size AND the
+    reward : risk of one real trade, so the baseline has the same shape.
+    """
     ok = np.flatnonzero(_window(f, interval_min))
     risks = np.array([abs(t["fill"] - t["stop"]) / t["context"]["atr"] for t in trades])
+    variable = rr is None
+    rrs = np.array([t["rr"] for t in trades]) if variable else None
     n = len(trades)
     if len(ok) < 50 or n == 0:
         return None
@@ -190,9 +209,14 @@ def random_baseline(f, interval_min, trades, rr, runs, seed, cost_r=bt.COST_R):
             if i <= blocked:
                 continue
             sign = int(rng.choice([1, -1]))
+            if variable:
+                k = int(rng.integers(len(risks)))
+                risk_points, rr_i = float(risks[k]) * atr[i], float(rrs[k])
+            else:
+                risk_points, rr_i = float(rng.choice(risks)) * atr[i], rr
             plan = {"signal": "CE" if sign == 1 else "PE", "entry": float(close[i]),
-                    "risk_points": float(rng.choice(risks)) * atr[i], "mode": "confirm"}
-            res = bt.simulate_trade(f, int(i), plan, interval_min, rr)
+                    "risk_points": risk_points, "mode": "confirm"}
+            res = bt.simulate_trade(f, int(i), plan, interval_min, rr_i)
             if res["status"] in ("OPEN", "PENDING"):
                 break
             if res["status"] == "SKIPPED":
@@ -209,22 +233,29 @@ def random_baseline(f, interval_min, trades, rr, runs, seed, cost_r=bt.COST_R):
 # ---------------------------------------------------------------------------
 # Judge one strategy on one market
 # ---------------------------------------------------------------------------
-def blocks_positive(f, interval_min, name, blocks=rs.BLOCKS):
+def blocks_positive(f, interval_min, name, blocks=rs.BLOCKS, run=None):
+    run = run or (lambda a, z: run_strategy(f, interval_min, name, i_start=a, i_end=z))
     days = list(pd.unique(f["day"]))
     edges = np.linspace(0, len(days), blocks + 1).astype(int)
     out = []
     for b in range(blocks):
         a, z = days[edges[b]], days[edges[b + 1] - 1]
         idx = np.where((f["day"].values >= a) & (f["day"].values <= z))[0]
-        t = run_strategy(f, interval_min, name, i_start=int(idx[0]), i_end=int(idx[-1]))
+        t = run(int(idx[0]), int(idx[-1]))
         out.append((len(t), float(np.mean([x["r_net"] for x in t])) if t else 0.0))
     return out
 
 
-def judge(f, index, interval, name, runs, seed=11):
+def judge(f, index, interval, name, runs, seed=11, run=None, rr=False):
+    """
+    run: optional function(i_start, i_end) -> trades (used by the short-target experiment);
+    rr: the reward : risk of the baseline (False = the strategy's own, None = each trade has its own).
+    """
     interval_min = INTERVAL_MINUTES[interval]
-    rr = STRATEGIES[name][1]
-    trades = run_strategy(f, interval_min, name)
+    if rr is False:
+        rr = STRATEGIES[name][1]
+    run_all = run or (lambda a, z: run_strategy(f, interval_min, name, i_start=a, i_end=z))
+    trades = run_all(30, None)
     res = {"strategy": name, "market": f"{index.upper()} {interval}", "trades": len(trades)}
     if not trades:
         res.update(avg=None, passed=False, why="no trades")
@@ -235,7 +266,7 @@ def judge(f, index, interval, name, runs, seed=11):
                avg_cost2=float(np.mean([t["r"] - 0.2 for t in trades])))
     ci = rs.bootstrap_avg_r(trades)
     res["ci"] = ci
-    blocks = blocks_positive(f, interval_min, name)
+    blocks = blocks_positive(f, interval_min, name, run=run)
     res["blocks"] = blocks
     res["blocks_pos"] = sum(1 for n, a in blocks if n and a > 0)
     dist = random_baseline(f, interval_min, trades, rr, runs, seed)
@@ -256,6 +287,119 @@ def judge(f, index, interval, name, runs, seed=11):
     return res
 
 
+# ---------------------------------------------------------------------------
+# The short-target experiment: today's entries and stops, a smaller target
+# ---------------------------------------------------------------------------
+SHORT_TARGETS = {
+    "r0.5": ("r", 0.5, "index target 0.5 x the stop distance"),
+    "r1.0": ("r", 1.0, "index target 1.0 x the stop distance"),
+    "rs10": ("rupees", 10.0, "option gains Rs 10 per share"),
+    "rs20": ("rupees", 20.0, "option gains Rs 20 per share"),
+    "pct30": ("percent", 30.0, "option gains 30% of its price"),
+    "pct50": ("percent", 50.0, "option gains 50% of its price"),
+}
+RR_MIN, RR_MAX = 0.1, 6.0
+
+
+def option_target_distance(index: str, side: str, spot: float, when, vix_pct: float, kind: str, amount: float):
+    """
+    Index points the market must move for the at-the-money option to gain `amount` (rupees per share, or
+    percent of its price). Black-Scholes with the given India VIX (in %) and the time to the nearest weekly
+    expiry; no time decay after the entry. None when it cannot be worked out.
+    """
+    if vix_pct is None or not np.isfinite(vix_pct) or vix_pct <= 0 or spot <= 0:
+        return None
+    step = cs.STRIKE_STEP[index]
+    strike = round(spot / step) * step
+    now = when.to_pydatetime() if hasattr(when, "to_pydatetime") else when
+    years = op.years_to_expiry(op.next_expiry(index, now), now)
+    sigma = vix_pct / 100.0
+    price = op.bs_price(spot, strike, years, sigma, side)
+    gain = amount if kind == "rupees" else price * amount / 100.0
+    if price <= 0 or gain <= 0:
+        return None
+    want = price + gain
+    lo, hi = (spot, spot * 1.5) if side == "CE" else (spot * 0.5, spot)
+    reachable = op.bs_price(hi if side == "CE" else lo, strike, years, sigma, side) >= want
+    if not reachable:
+        return abs((hi if side == "CE" else lo) - spot)                  # not reachable within 50%: a huge distance
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        value = op.bs_price(mid, strike, years, sigma, side)
+        if side == "CE":
+            lo, hi = (mid, hi) if value < want else (lo, mid)
+        else:
+            lo, hi = (lo, mid) if value < want else (mid, hi)
+    return abs((lo + hi) / 2 - spot)
+
+
+def main_entries(f, index, interval_min):
+    """The current candle-pattern rules (default filters): +1 / -1 on the decision candle and the stop distance."""
+    sides, risks = np.zeros(len(f), dtype=int), np.zeros(len(f))
+    for i in range(30, len(f)):
+        plan = cs.evaluate(f, i, index, interval_min)
+        if plan["signal"] != "NONE":
+            sides[i] = 1 if plan["signal"] == "CE" else -1
+            risks[i] = float(plan["risk_points"])
+    return sides, risks
+
+
+def target_rr(f, index, i, side, risk, variant):
+    """Reward : risk of the trade decided at candle i for this short-target variant (None = no trade)."""
+    kind, amount, _ = SHORT_TARGETS[variant]
+    if kind == "r":
+        return amount
+    spot = float(f["close"].values[i])
+    vix = f["vix_prev"].values[i]
+    d = option_target_distance(index, "CE" if side == 1 else "PE", spot, f.index[i], vix, kind, amount)
+    if d is None or risk <= 0:
+        return None
+    return float(min(max(d / risk, RR_MIN), RR_MAX))
+
+
+def run_short_target(f, index, interval_min, variant, entries, cost_r=bt.COST_R, i_start=30, i_end=None):
+    """The main backtest's trades (same simulator, one at a time), with this variant's target."""
+    sides, risks = entries
+    i_end = len(f) - 1 if i_end is None else min(i_end, len(f) - 1)
+    atr, close = f["atr"].values, f["close"].values
+    trades, i = [], max(i_start, 30)
+    while i < i_end:
+        if sides[i] == 0:
+            i += 1
+            continue
+        rr = target_rr(f, index, i, int(sides[i]), float(risks[i]), variant)
+        if rr is None:
+            i += 1
+            continue
+        plan = {"signal": "CE" if sides[i] == 1 else "PE", "entry": float(close[i]),
+                "risk_points": float(risks[i]), "mode": "confirm"}
+        res = bt.simulate_trade(f, i, plan, interval_min, rr)
+        if res["status"] == "SKIPPED":
+            i += 1
+            continue
+        if res["status"] in ("OPEN", "PENDING"):
+            break
+        trades.append({
+            "time": f.index[i].isoformat(), "side": plan["signal"], "fill": res["fill"],
+            "stop": res["stop"], "status": res["status"], "r": res["r"], "rr": rr,
+            "r_net": round(res["r"] - cost_r, 3), "bars": res["bars"],
+            "context": {"atr": float(atr[i]), "start_min": int(f["start_min"].values[i]), "pattern": variant},
+        })
+        i = res["exit_idx"] + 1
+    return trades
+
+
+def judge_short(f, index, interval, variant, runs, entries, seed=11):
+    interval_min = INTERVAL_MINUTES[interval]
+    run = lambda a, z: run_short_target(f, index, interval_min, variant, entries, i_start=a, i_end=z)
+    res = judge(f, index, interval, variant, runs, seed, run=run, rr=None)
+    trades = run(30, None)
+    if trades:
+        res["avg_rr"] = float(np.mean([t["rr"] for t in trades]))
+        res["clamped"] = sum(1 for t in trades if t["rr"] in (RR_MIN, RR_MAX)) / len(trades)
+    return res
+
+
 def reference_row(f, index, interval):
     """The current candle-pattern rules, for comparison (same data, same costs)."""
     t = bt.run_backtest(f, index, INTERVAL_MINUTES[interval])
@@ -268,6 +412,9 @@ def main():
     ap.add_argument("--index", choices=["nifty", "sensex"])
     ap.add_argument("--interval", choices=["5m", "15m"])
     ap.add_argument("--strategy", choices=list(STRATEGIES))
+    ap.add_argument("--short-targets", action="store_true",
+                    help="run the short-target experiment (today's entries, smaller targets) instead of the four strategies")
+    ap.add_argument("--variant", choices=list(SHORT_TARGETS), help="with --short-targets: only this variant")
     ap.add_argument("--runs", type=int, default=300, help="random runs per test (default 300)")
     ap.add_argument("--db", default=candle_store.DB_FILE)
     a = ap.parse_args()
@@ -287,15 +434,20 @@ def main():
             print(f"\n{'=' * 96}\n{index.upper()} {interval}: {days} trading days. "
                   f"Current candle-pattern rules for comparison: {ref['trades']} trades, avg {ref['avg']:+.2f}R, "
                   f"win {ref['win'] * 100:.0f}%")
-            for name in ([a.strategy] if a.strategy else STRATEGIES):
-                r = judge(f, index, interval, name, a.runs)
+            names = (([a.variant] if a.variant else list(SHORT_TARGETS)) if a.short_targets
+                     else ([a.strategy] if a.strategy else list(STRATEGIES)))
+            entries = main_entries(f, index, INTERVAL_MINUTES[interval]) if a.short_targets else None
+            for name in names:
+                r = (judge_short(f, index, interval, name, a.runs, entries) if a.short_targets
+                     else judge(f, index, interval, name, a.runs))
                 results.append(r)
                 if r["avg"] is None:
                     print(f"  {name:<11} no trades")
                     continue
                 lo, hi = r["ci"] if r["ci"] else (float("nan"), float("nan"))
                 bl = " ".join(f"{x:+.2f}" for _, x in r["blocks"])
-                print(f"  {name:<11} trades {r['trades']:>3} | win {r['win'] * 100:>3.0f}% | avg {r['avg']:+.2f}R "
+                extra = f" | target {r['avg_rr']:.2f}R" if "avg_rr" in r else ""
+                print(f"  {name:<11} trades {r['trades']:>3} | win {r['win'] * 100:>3.0f}%{extra} | avg {r['avg']:+.2f}R "
                       f"(95%: {lo:+.2f}..{hi:+.2f}) | at 0.2R cost {r['avg_cost2']:+.2f} | "
                       f"blocks [{bl}] | p vs random {r['p']:.3f}")
                 print(f"              GATE: {'PASS' if r['passed'] else 'fail'}"

@@ -26,12 +26,12 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `candle_analysis.py` | Explains the decision for the dashboard: the four "Live analysis" steps in the decision banner and the list of recent setups that were dropped, and why (section 3). It adds no rules. |
 | `candle_chain.py` | Turns option open interest into the plain facts of the dashboard's Option chain card (put/call ratio, walls, change), and builds the open-interest features for the optional `oi_*` checks (section 5). |
 | `candle_research.py` | Honest checks on your saved candles: walk-forward blocks, cost stress, uncertainty range, breakdowns, extra checks (section 7c). |
-| `strategy_lab.py` | Tests other strategy types (opening-range breakout, VWAP pullback, trend continuation, mean reversion) on your saved candles against a strict pass/fail gate (section 7d). Changes no live rules. |
+| `strategy_lab.py` | Tests other strategy types (opening-range breakout, VWAP pullback, trend continuation, mean reversion) on your saved candles against a strict pass/fail gate (section 7d). Also runs the short-target experiment (section 7e). Changes no live rules. |
 | `candle_baseline.py` | Reality check: compares the strategy with random entries (same exits, costs and stop sizes) to see if it beats chance (see section 7b). |
 | `test_no_lookahead.py` | Safety test: checks that the rules never use the future. |
 | `test_candle_analysis.py` | Checks that the Live analysis steps always agree with the real decision. |
 | `test_candle_research.py` | Checks the research maths, and the VWAP / volume / gap features (no look-ahead). |
-| `test_strategy_lab.py` | Checks the strategy lab: no look-ahead, same simulator and costs as the main backtest, and that random data fails the gate. |
+| `test_strategy_lab.py` | Checks the strategy lab: no look-ahead, same simulator and costs as the main backtest, the short-target maths and baseline, and that random data fails the gate. |
 | `test_candle_chain.py` | Checks the open-interest facts (last value per day, previous session, walls, edge cases). |
 | `test_oi_filters.py` | Checks the open-interest features and the three optional `oi_*` checks: right numbers, no look-ahead, off by default, no numbers on thin history. |
 | `test_option_chain.py` | Checks the option-chain saving with a fake Angel One (nearest expiry, strikes, no duplicates, no running candle). |
@@ -42,6 +42,7 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `risk_limits.py` | Optional daily limits and the position-size helper, all off until you set values in `.env` (section 3d). |
 | `session_check.py` | A read-only end-of-day check: trading day, fresh data, the day's ideas and alerts, what was saved, your settings (section 3d). |
 | `test_holidays.py`, `test_risk_limits.py`, `test_session_check.py` | Tests for the three items above. |
+| `test_speed.py` | Checks the first-load speed-ups with fake Angel One calls: page requests go first, slow refreshes never block the page, Refresh waits for fresh numbers, the alert loop looks once per candle. |
 | `test_late_trade.py` | Checks that a late-day trade is closed at the day's last candle even without a 15:25 candle, and that a running session stays open. |
 | `.env.example` | Template for your private settings (Telegram, Angel One, optional risk limits). Copy it to `.env` and fill in your values (sections 3c and 9). |
 | `requirements.txt` | The packages the project needs (`pip install -r requirements.txt`). |
@@ -93,7 +94,8 @@ Tip: you do not have to activate the environment. You can also run any command w
 | Telegram: check the settings / send a test message / find the group id | `python telegram_notify.py --check` / `--test` / `--find-chat` |
 | Test the Telegram alerts (no real bot needed) | `python test_telegram_notify.py` |
 | End-of-day check (read-only) | `python session_check.py` (options `--date YYYY-MM-DD`, `--no-live`) |
-| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_candle_chain.py`, `python test_oi_filters.py`, `python test_strategy_lab.py`, `python test_holidays.py`, `python test_risk_limits.py`, `python test_session_check.py`, `python test_late_trade.py` |
+| Test smaller targets on the current rules' entries (section 7e) | `python strategy_lab.py --short-targets` (options `--index`, `--interval`, `--variant r0.5\|r1.0\|rs10\|rs20\|pct30\|pct50`, `--runs`) |
+| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_candle_chain.py`, `python test_oi_filters.py`, `python test_strategy_lab.py`, `python test_holidays.py`, `python test_risk_limits.py`, `python test_session_check.py`, `python test_late_trade.py`, `python test_speed.py` |
 
 Stop any of them with **Ctrl + C**.
 
@@ -521,6 +523,20 @@ The closest was the VWAP pullback on NIFTY 15m (+0.06 R, 3 of 4 blocks positive,
 
 ---
 
+## 7e. Short-target experiment (`python strategy_lab.py --short-targets`)
+
+Question: would a smaller target (a quick small gain per share instead of 2 times the stop) make the current rules profitable? Same entries and stops as the current candle-pattern rules; only the target changes. Six variants were written down before looking at any result and are never tuned:
+
+| Variant | The target is |
+|---|---|
+| `r0.5`, `r1.0` | 0.5 / 1.0 times the stop distance on the index (today: 2.0) |
+| `rs10`, `rs20` | where an at-the-money option has gained Rs 10 / Rs 20 per share |
+| `pct30`, `pct50` | where an at-the-money option has gained 30% / 50% of its price |
+
+The option variants turn the gain into an index distance with Black-Scholes (the option's price at entry from the previous day's India VIX and the time to the nearest weekly expiry); that distance divided by the stop distance is that trade's reward : risk (kept between 0.1 and 6). Time decay after the entry is not included, so these variants are a little easier than reality; with no VIX value no trade is made. The same gate as in section 7d applies, and the random-entry comparison copies the stop size and the reward : risk of the real trades. It writes nothing and changes no live rule. **Result on the one-year data: see below (added when the run finishes).**
+
+---
+
 ## 8. Idea history (success or failed)
 
 The "Trade idea" card clears when the next candle comes. The idea is NOT lost. Every idea is saved automatically in **Idea history** (the section below the chart) with:
@@ -611,6 +627,13 @@ ANGEL_TOTP_SECRET=
 
 - **Read-only use.** This project only reads candles and prices. It has no code to place, change or cancel an order. The login still needs your PIN and TOTP secret, and there is no view-only login at Angel One, so keep `.env` private. If you suspect a leak: change your Angel One PIN, enable TOTP again and delete the app in the SmartAPI portal.
 - **Rate limits.** Angel One refuses requests that come too fast ("exceeding access rate" / "Too many requests"). All Angel One requests therefore go through one queue: one at a time, 2 seconds apart, with up to 3 retries. A first load of one market can take about 5 seconds; after that the answer is cached for 10 seconds. Each market is built once at a time, so several browser tabs and the alert loop never repeat the same calls.
+- **Why the first load can be slow, and what was done about it.** On a live market day about half of the Angel One calls from this PC were refused with "exceeding access rate", even with a 2 second pause and a single queue (it looks like a limit on the connection, not on how fast this tool asks). Every refused call costs a 3 to 12 second wait, and a page needs two to three calls, so an uncached page could take 12 to 45 seconds. The dashboard now avoids making the page wait:
+  - **Last copy first.** A routine refresh waits at most 4 seconds for fresh numbers; if they are not ready it shows the last copy at once (up to 10 minutes old) with "refreshing" next to the update time, and the next refresh (15 seconds later) brings the new one. The Refresh button and a change of market, candle size or source always wait for fresh numbers (`/api/data?...&fresh=1`).
+  - **Futures volume and the option chain no longer block.** After the first fetch, an older copy is used at once while a new one is fetched in the background. The very first option chain shows the last saved day and switches to live on the next refresh. The first futures fetch still waits, because it decides the VWAP and so the ideas.
+  - **Page requests go first.** Requests for the page you are looking at go before background ones (the alert loop and cache top-ups). A background request waits for a queued page request (at most 10 seconds) and retries only once.
+  - **The alert loop looks once per candle** instead of every 30 seconds (an idea can only appear when a candle closes); if the data is late with the new candle it looks again at the next tick. This cuts its Angel One calls by about three quarters. The option chain is refreshed at most every 2 minutes.
+  - **Diagnosis.** The page data has a `timing` block (seconds for candles, futures, VIX, option chain and the whole build, plus counters of Angel One calls, refused calls and the last 14 calls). Open `http://127.0.0.1:5000/api/data?source=angel&index=nifty&interval=5m` to see it.
+  - **What is not solved:** a market you have never opened since the dashboard started (for example 1 minute candles) still needs its first build, which waits for the candles and the futures; if Angel One refuses calls at that moment it takes a while. A page that was open before will show the last copy at once.
 - **Logs.** When a call fails, the Angel One library prints and logs the request headers, which include your API key. The project switches the library's console log off, and the `logs/` folder is ignored by Git. Do not paste its content anywhere.
 - **Tested** with a real account: login, 5m and 15m candles for both indexes, the year of history, futures candles and option prices (outside market hours). Watch the first live market session: the live alerts on Angel One data have not run during market hours yet.
 - **Key type:** the app was created as a "Trading" API key, and it worked for candles, futures and option prices.
@@ -634,6 +657,7 @@ ANGEL_TOTP_SECRET=
 | Option price says ESTIMATE with Angel One | Live option price could not be fetched. Read the `[option price] ...` message in the terminal. |
 | Angel One login failed | Check the four `ANGEL_*` values in `.env` (or in the same terminal for `live_monitor.py`) and that the TOTP value is the long secret text, not the 6-digit code. |
 | "Couldn't parse the JSON response ... exceeding access rate" or "Angel One is busy" | Angel One refused requests that came too fast. The tool pauses and retries by itself and keeps the last good data for up to 5 minutes. If it keeps happening, close extra dashboard tabs and wait a minute. |
+| The update time says "refreshing" | You are looking at the last copy (up to 10 minutes old) while fresh numbers are fetched in the background. It normally clears within a refresh or two; if it stays, Angel One is refusing calls (see the `timing` block, section 9). |
 | `ModuleNotFoundError: SmartApi`, `pyotp`, `logzero` or `websocket` | Run `pip install -r requirements.txt` in the project's environment. |
 | Dashboard says "Market open" on a holiday | `holidays.csv` has only the dates entered so far. Add the missing exchange holidays from the NSE calendar (section 3d). |
 | Volume says "not available for this data" | You are on Yahoo, or the futures data could not be fetched. VWAP then uses the plain average price of the day. |
