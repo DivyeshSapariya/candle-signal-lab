@@ -65,6 +65,18 @@ def day_status(stats: dict, cfg: dict) -> dict:
     }
 
 
+def per_lot(loss_per_unit, profit_per_unit, lot_size):
+    """
+    Rupees per LOT if the stop loss / the target is hit (before brokerage, taxes and the bid-ask gap).
+    Always shown, it needs no settings. None when a number is missing.
+    """
+    if not lot_size or loss_per_unit is None or profit_per_unit is None:
+        return None
+    loss, profit = float(loss_per_unit) * lot_size, float(profit_per_unit) * lot_size
+    return {"size": int(lot_size), "loss": round(loss), "profit": round(profit),
+            "ratio": round(profit / loss, 2) if loss > 0 else None}
+
+
 def position_size(cfg: dict, loss_per_unit, lot_size):
     """
     How many lots fit the risk budget. loss_per_unit = rupees lost per option unit at the stop loss.

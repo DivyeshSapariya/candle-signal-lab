@@ -40,6 +40,11 @@ def main():
     zero = rl.position_size(cfg, 40.0, 65)                                       # 2600 per lot > budget
     assert zero["lots"] == 0 and "more than your budget" in zero["note"]
     assert rl.position_size(off, 20.0, 65) is None and rl.position_size(cfg, None, 65) is None
+    # rupees per lot (always on, no settings): loss 20 and profit 40 per unit, lot 65
+    pl = rl.per_lot(20.0, 40.0, 65)
+    assert pl == {"size": 65, "loss": 1300, "profit": 2600, "ratio": 2.0}, pl
+    assert rl.per_lot(10.0, 10.0, 65)["profit"] == 650          # the Rs 10 example: Rs 10 x 65 = Rs 650 per lot
+    assert rl.per_lot(None, 40.0, 65) is None and rl.per_lot(20.0, 40.0, None) is None and rl.per_lot(20.0, 40.0, 0) is None
     assert rl.position_size(cfg, 20.0, None) is None
 
     # --- journal: a limit saves NEW ideas as SKIPPED, with no alert and no trade ---

@@ -352,12 +352,13 @@ def build_payload(source: str, index: str, interval: str) -> dict:
                 now=now, live_price=live_price, expiry=live_expiry)
         except Exception as error:
             print(f"[option price] could not calculate option levels: {error}")
-        try:                                              # display-only: how many lots fit your risk (off unless set in .env)
+        try:                                              # display-only: rupees per lot, and how many lots fit your risk (if set in .env)
             o = plan.get("option_levels")
-            plan["sizing"] = (risk_limits.position_size(risk_cfg, o.get("loss_per_unit"), option_lot_size(index))
-                              if o else None)
+            lot_size = option_lot_size(index) if o else None
+            plan["lot"] = risk_limits.per_lot(o.get("loss_per_unit"), o.get("profit_per_unit"), lot_size) if o else None
+            plan["sizing"] = risk_limits.position_size(risk_cfg, o.get("loss_per_unit"), lot_size) if o else None
         except Exception as error:
-            print(f"[risk] position size not available: {error}")
+            print(f"[risk] per-lot numbers not available: {error}")
 
     # Automatic history: save every idea of today (even ones that already vanished from the card),
     # then check how earlier ideas ended. Finished ideas also go into the memory.
@@ -549,6 +550,7 @@ def api_history():
     for item in data["items"]:
         item["option_levels"] = _history_option_levels(item)
     data["lessons"] = candle_memory.lessons()
+    data["lot_sizes"] = {name.upper(): option_lot_size(name) for name in ("nifty", "sensex")}     # for the rupees-per-lot lines
     return jsonify(data)
 
 
@@ -1177,6 +1179,7 @@ function h(tag, cls, text, kids) {
 }
 const fmt = (n) => Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const rs = (n) => '\u20B9' + fmt(n);
+const rs0 = (n) => '\u20B9' + Math.round(n).toLocaleString('en-IN');          // whole rupees, for the per-lot numbers
 const rUnit = (v) => (v === null || v === undefined) ? '' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R';
 const clear = (node) => { node.textContent = ''; return node; };
 
@@ -1505,8 +1508,11 @@ function renderDecision(d) {
     const tiles = h('div', 'tiles');
     if (o) {
       tiles.appendChild(tile('buy', 'Buy price', rs(o.entry_price), 'Now ' + rs(o.now_price)));
-      tiles.appendChild(tile('stop', 'Stop loss', rs(o.stop_price), 'Loss ' + rs(o.loss_per_unit) + ' / unit'));
-      tiles.appendChild(tile('target', 'Target', rs(o.target_price), 'Profit ' + rs(o.profit_per_unit) + ' / unit'));
+      const lot = p.lot;
+      tiles.appendChild(tile('stop', 'Stop loss', rs(o.stop_price),
+        'Loss ' + rs(o.loss_per_unit) + ' / unit' + (lot ? ' \u00B7 ' + rs0(lot.loss) + ' per lot' : '')));
+      tiles.appendChild(tile('target', 'Target', rs(o.target_price),
+        'Profit ' + rs(o.profit_per_unit) + ' / unit' + (lot ? ' \u00B7 ' + rs0(lot.profit) + ' per lot' : '')));
     } else {
       tiles.appendChild(tile('buy', 'Index buy', fmt(p.entry), p.option + ' (ATM)'));
       tiles.appendChild(tile('stop', 'Index stop', fmt(p.stop), 'Risk ' + p.risk_points.toFixed(1) + ' pts'));
@@ -1644,6 +1650,12 @@ function renderTrade(d) {
   kv(box, 'Target at', fmt(p.target), 'up');
   kv(box, 'Risk : reward', p.risk_points.toFixed(1) + ' : ' + p.reward_points.toFixed(1) + ' points');
 
+  if (p.lot) {
+    box.appendChild(h('div', 'group', 'Per lot (' + p.lot.size + ' units)'));
+    kv(box, 'Profit if the target is hit', '+' + rs0(p.lot.profit), 'up');
+    kv(box, 'Loss if the stop loss is hit', '-' + rs0(p.lot.loss), 'down');
+    box.appendChild(h('div', 'muted small', 'Before brokerage, taxes and the bid-ask gap. Buying more lots multiplies both numbers.'));
+  }
   if (p.sizing) {
     const z = p.sizing;
     box.appendChild(h('div', 'group', 'Position size (your risk settings)'));
@@ -1847,6 +1859,8 @@ function buildDetail(it) {
     kv(lv, 'Stop loss at', rs(ol.stop_price), 'down');
     kv(lv, 'Target at', rs(ol.target_price), 'up');
     kv(lv, 'Loss / profit per unit', '-' + rs(ol.loss_per_unit) + '  /  +' + rs(ol.profit_per_unit));
+    const lotSize = histData && histData.lot_sizes ? histData.lot_sizes[it.index] : null;
+    if (lotSize) kv(lv, 'Per lot of ' + lotSize + ' (today\'s lot size)', '-' + rs0(ol.loss_per_unit * lotSize) + '  /  +' + rs0(ol.profit_per_unit * lotSize));
     const srcText = ol.captured === 'live'
       ? 'LIVE option price, saved at the moment this idea appeared.'
       : ol.captured === 'estimate_now'
