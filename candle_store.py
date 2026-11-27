@@ -69,6 +69,24 @@ CREATE TABLE IF NOT EXISTS option_oi (
     close REAL, volume REAL, oi REAL,
     PRIMARY KEY (idx, expiry, strike, side, ts)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS news (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    source    TEXT    NOT NULL,     -- the feed (see news_feed.py)
+    guid      TEXT    NOT NULL,     -- the feed's own id for the story (or its link)
+    published INTEGER NOT NULL,     -- seconds since 1970 (UTC)
+    fetched   INTEGER NOT NULL,
+    title     TEXT, summary TEXT, link TEXT,
+    tags      TEXT,                 -- comma separated keyword tags
+    UNIQUE (source, guid)
+);
+CREATE INDEX IF NOT EXISTS news_published ON news (published);
+CREATE TABLE IF NOT EXISTS news_alerted (
+    news_id INTEGER PRIMARY KEY,    -- a market-moving story that was already sent (or skipped) as a Telegram alert
+    title_key TEXT, at INTEGER
+);
+CREATE TABLE IF NOT EXISTS feed_state (
+    source TEXT PRIMARY KEY, etag TEXT, last_modified TEXT, checked INTEGER, ok INTEGER, note TEXT
+);
 CREATE TABLE IF NOT EXISTS vix_daily (
     day   TEXT PRIMARY KEY,         -- YYYY-MM-DD
     close REAL

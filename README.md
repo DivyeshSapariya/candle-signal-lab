@@ -43,6 +43,16 @@ For personal use only. This is not financial advice. No tool can predict the mar
 | `session_check.py` | A read-only end-of-day check: trading day, fresh data, the day's ideas and alerts, what was saved, your settings. It runs by itself after the 16:00 collection and sends you a summary (section 3d). |
 | `test_holidays.py`, `test_risk_limits.py`, `test_session_check.py` | Tests for the three items above. |
 | `test_speed.py` | Checks the first-load speed-ups with fake Angel One calls: page requests go first, slow refreshes never block the page, Refresh waits for fresh numbers, the alert loop looks once per candle. |
+| `trailing_stop.py` | Trailing stop-loss advice for a running idea: starts when the option is Rs 20 above your buy price, then follows the highest price 15 rupees below it (section 7g). Advice only. |
+| `stop_ladder.py` | The older fixed stop ladder (breakeven, lock +0.5 R, lock +1 R) and the option-price estimate the trailing stop uses. No longer shown on the dashboard. |
+| `news_feed.py` | Market news from the publishers' own public RSS feeds, stored in your database for the dashboard's News card and the chart's News option (section 3e). Context only. |
+| `candle_context.py` | The plain-information numbers behind the **Market context** card (daily trend, last week, today's gap, VIX trend), the RSI and MACD chart panels and the pivot levels (section 7h). Context only. |
+| `test_candle_context.py` | Checks those numbers with made-up data: right maths, no look-ahead. |
+| `test_news_alerts.py` | Checks the market-news Telegram alerts: nothing old, nothing twice, one copy of a headline, at most 4 per message. |
+| `test_news_feed.py` | Checks the news reader with fake feeds: parsing, tags, no duplicates, polite fetching, failing feeds. |
+| `test_angel_relogin.py` | Checks that an expired Angel One token (AG8001) causes one fresh login and one repeated request. |
+| `test_trailing_stop.py` | Checks the trailing stop rule (starts at +Rs 20, follows 15 below the highest, never moves down), the one-line Telegram message, one message per rise of Rs 3 (only for alerted ideas), the open-ideas list, and that the paper result keeps using the first stop. |
+| `test_stop_ladder.py` | Checks the older ladder steps and levels and the option-price estimate. |
 | `test_room_check.py` | Checks the `room` check: the distance maths, the check inside the rules (off by default, same entry and stop), no look-ahead, and the experiment's statistics. |
 | `test_alert_markets.py` | Checks that new-idea alerts go only to the markets in `ALERT_MARKETS`, and that other markets are saved without an alert (and so get no result alert). |
 | `test_waiting_ideas.py` | Checks that waiting ideas of markets nobody is looking at are settled once per candle, with one result alert and no new ideas. |
@@ -96,10 +106,11 @@ Tip: you do not have to activate the environment. You can also run any command w
 | Check that the rules never use the future | `python test_no_lookahead.py` |
 | Telegram: check the settings / send a test message / find the group id | `python telegram_notify.py --check` / `--test` / `--find-chat` |
 | Test the Telegram alerts (no real bot needed) | `python test_telegram_notify.py` |
+| Fetch / show market news (the dashboard fetches by itself) | `python news_feed.py fetch` (`--force`), `status`, `latest --important`, `retag` |
 | End-of-day check (runs by itself after 16:00; by hand if you want) | `python session_check.py` (options `--date YYYY-MM-DD`, `--no-live`, `--auto`, `--force`) |
 | Test the `room` check on the current rules (section 7f) | `python strategy_lab.py --room-check` (options `--index`, `--interval`, `--since YYYY-MM-DD`, `--runs`) |
 | Test smaller targets on the current rules' entries (section 7e) | `python strategy_lab.py --short-targets` (options `--index`, `--interval`, `--variant r0.5\|r1.0\|rs10\|rs20\|pct30\|pct50`, `--runs`) |
-| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_candle_chain.py`, `python test_oi_filters.py`, `python test_strategy_lab.py`, `python test_holidays.py`, `python test_risk_limits.py`, `python test_session_check.py`, `python test_late_trade.py`, `python test_speed.py`, `python test_waiting_ideas.py`, `python test_alert_markets.py`, `python test_room_check.py` |
+| Other tests | `python test_candle_analysis.py`, `python test_candle_research.py`, `python test_candle_backfill.py`, `python test_option_chain.py`, `python test_candle_chain.py`, `python test_oi_filters.py`, `python test_strategy_lab.py`, `python test_holidays.py`, `python test_risk_limits.py`, `python test_session_check.py`, `python test_late_trade.py`, `python test_speed.py`, `python test_waiting_ideas.py`, `python test_alert_markets.py`, `python test_room_check.py`, `python test_stop_ladder.py`, `python test_trailing_stop.py`, `python test_news_feed.py`, `python test_candle_context.py`, `python test_news_alerts.py` |
 
 Stop any of them with **Ctrl + C**.
 
@@ -117,9 +128,9 @@ In the page: use the buttons at the top to pick NIFTY / SENSEX and 1 / 5 / 15 mi
   - Above the chart: price and change, the CE / PE legend, "Reset view", a row of chart options (below) and zoom presets (last 50 candles, last 100, All).
   - When there is an idea, dashed ENTRY, STOP LOSS, TARGET and NEXT LEVEL lines are drawn on the chart.
   - Under the chart, one tile per fact: VWAP (and whether the price is above or below), the opening gap, volume against its average, and from the option chain the put/call OI ratio, the call wall and the put wall.
-- **Tier 2, context:** **Recent candle patterns**; **Why this decision** (the checklist split into "Must pass" and "Bonus points", with the agreement meter); and the **Paper-trade scoreboard** (ideas, win rate, net result, latest ideas).
+- **Tier 2, context:** **Recent candle patterns**; **Market context** (the daily trend, last week's range, today's gap, yesterday, today so far, the saved year, the India VIX trend and the pivot levels; section 7h); **Open ideas** (only while an idea is running: the trailing-stop advice, see section 7g, and a lot-size line: the lot size, the loss for one lot at the first stop and, when `RISK_CAPITAL` and `RISK_PER_TRADE_PCT` are set, how many lots fit your budget; it stays visible after the decision candle, unlike Trade details); **Why this decision** (the checklist split into "Must pass" and "Bonus points", with the agreement meter); and the **Paper-trade scoreboard** (ideas, win rate, net result, latest ideas).
   - Option chain (in the right column next to the chart): a bar per strike for calls (red) and puts (green) with the OI and its change since the previous session, the strike nearest the index highlighted, and a few plain sentences (where the index sits between the walls). With Angel One it uses the current OI (one read-only request, cached for a minute); with Yahoo, or if that fails, the last saved day (section 3b). The heading says "live" or "saved". **Facts only: no rule or alert uses it.**
-- **Tier 3, track record:** **Idea history** and **What the tool learned** (tabs in one card; click a row in the history to open its story, prices and chart), and **Recent setups with no idea**: the last 8 times a pattern appeared but no idea was made, each with the first rule that said no (for example "15 min trend DOWN, 60 min trend UP - does not agree"). This shows why you see so few ideas.
+- **Tier 3, track record:** **Idea history** and **What the tool learned** (tabs in one card; click a row in the history to open its story, prices and chart), **Market news** (the latest headlines from the publishers' RSS feeds, with a "Market-moving" filter; section 3e), and **Recent setups with no idea**: the last 8 times a pattern appeared but no idea was made, each with the first rule that said no (for example "15 min trend DOWN, 60 min trend UP - does not agree"). This shows why you see so few ideas.
 - A collapsed **Quick guide** and a short safety note finish the page.
 
 **Chart options.** A row of buttons above the chart switches each item on or off; the page remembers your choice. Indicator lines come from the server and use only finished candles.
@@ -137,6 +148,8 @@ In the page: use the buttons at the top to pick NIFTY / SENSEX and 1 / 5 / 15 mi
 | No-trade zones | Shaded bands behind the candles where the rules say no: grey for the first 15 minutes and after 3 pm, red for the afternoon of an expiry day (from 1 pm) | On |
 | Day open | A line at today's opening price, labelled with the opening gap (for example "Open (gap +0.50%)") | Off |
 | Risk / reward zone | When an idea is active, a green band from entry to target and a red band from entry to stop, starting at the decision candle | On |
+| News | Market-moving headlines (RBI, Fed, inflation, budget, FII flows, geopolitics, big index moves) of the last 3 days as small amber circles on the candle they were published in, labelled with the topic (section 3e) | Off |
+| Pivot levels | Yesterday's classic floor pivots (P, R1 to R3, S1 to S3) and the central pivot range (CPR top, bottom) as price lines (section 7h) | Off |
 | Past ideas | Every journal idea for the market and candle size on screen, on its signal candle, labelled with the side and result (for example "CE +1.90R"), green for success, red for failed, amber for time exit, grey for waiting | On |
 
 Past ideas older than the visible range appear when you zoom out (press "All").
@@ -150,6 +163,8 @@ Past ideas older than the visible range appear when you zoom out (press "All").
 | Volume panel | Futures volume divided by its recent 20-candle average, so only days with futures volume have bars | 1x (the optional volume check) |
 | OI ratio panel | Put/call open-interest ratio | 1 |
 | OI build-up panel | Put minus call OI build-up over 30 minutes, in % (green = more puts written) | 0 |
+| RSI panel | Wilder RSI(14) of the candles on screen. Information only | 70 and 30 (the usual marks) |
+| MACD panel | MACD 12/26/9: histogram (green / red), MACD line (blue), signal line (amber). Information only | 0 |
 
 The two OI panels use the **saved** option history only (section 3b), so they show past days that were saved, not the live minute. A panel says "No data for the days on screen yet" when nothing is saved for them. None of the chart options changes a rule or an alert.
 
@@ -196,7 +211,7 @@ df = load_candles("nifty", "5m")
 vix = load_vix()
 ```
 
-**Daily schedule:** a Windows scheduled task named `AI-Trading-Candle-Collect` runs every Monday to Friday at 4:00 pm (after the market closes). It has four steps, one after the other: `candle_store.py collect` (Yahoo candles and India VIX), `candle_store.py backfill-futures --days 5` (the futures volume), `candle_store.py backfill-options --days 5` (the option chain, about 3 minutes) and `session_check.py --auto` (the end-of-day check, section 3d); the futures and option steps need the Angel One values in `.env`. If one step fails, the other still runs. If the PC was off at that time, it runs when the PC is next on and you are logged in. Run `collect` yourself at least once a week; if the PC is off for more than 7 days, those 1-minute candles are lost for good. To remove the task: `Unregister-ScheduledTask -TaskName "AI-Trading-Candle-Collect" -Confirm:$false` (PowerShell).
+**Daily schedule:** a Windows scheduled task named `AI-Trading-Candle-Collect` runs every Monday to Friday at 4:00 pm (after the market closes). It has five steps, one after the other: `candle_store.py collect` (Yahoo candles and India VIX), `candle_store.py backfill-futures --days 5` (the futures volume), `candle_store.py backfill-options --days 5` (the option chain, about 3 minutes), `session_check.py --auto` (the end-of-day check, section 3d) and `news_feed.py fetch` (the market news, section 3e); the futures and option steps need the Angel One values in `.env`. If one step fails, the other still runs. If the PC was off at that time, it runs when the PC is next on and you are logged in. Run `collect` yourself at least once a week; if the PC is off for more than 7 days, those 1-minute candles are lost for good. To remove the task: `Unregister-ScheduledTask -TaskName "AI-Trading-Candle-Collect" -Confirm:$false` (PowerShell).
 
 The backtest still downloads from Yahoo by default. To test on your saved history, load it with `load_candles` and pass it to `compute_features` and `run_backtest`, or export a CSV and use `candle_backtest.py --csv`. `candle_baseline.py` and `candle_research.py` already read the saved history.
 
@@ -310,6 +325,14 @@ Put them in `.env` or set them in the terminal (a value set in the terminal wins
 | `ALERT_MARKETS` | The markets that send **new-idea alerts**, and that the loop watches. Default `nifty:5m,sensex:5m`. An idea found in any other market or candle size (for example while you look at 15 minutes in the page) is still saved in the history, but no alert is sent for it. |
 | `ALERT_SOURCE` | `yahoo` or `angel`. Default: `angel` when the four `ANGEL_*` values are in `.env`, otherwise `yahoo`. |
 
+**Stop advice** (only for an idea that had a new-idea alert; one line each time the trailing stop rises by at least Rs 3):
+
+```
+SENSEX 84400 CE - SL 252 ------ OLD SL 248 | MP 260
+```
+
+`SL` is the stop to use now, `OLD SL` the one before (the first message shows your first stop), `MP` the option's market price now (an estimate). Advice only: change the order yourself.
+
 ### Cautions
 
 - **Keep the token private.** It belongs only in `.env`, which Git ignores. Do not put it in `.env.example`, in the code, in a screenshot or in a chat. If it leaks, open @BotFather, send `/revoke`, pick your bot and put the new token in `.env`.
@@ -339,6 +362,20 @@ Put them in `.env` or set them in the terminal (a value set in the terminal wins
 **End-of-day check (automatic).** The 16:00 scheduled task runs `session_check.py --auto` as its last step, after the day's candles, futures volume and option open interest are saved. You do not need to run anything. It checks the most recent session that has closed, saves the report to `reports/session_check_<date>.txt` (your private results: the folder is git-ignored) and sends a short **Telegram summary**: the day's ideas and net result, plus every item that needs a look ("N item(s) to check" with the lines, or "Nothing to check"). It does nothing on weekends and holidays, never repeats a day that already has a report (`--force` redoes one), and if the PC was off at 16:00 it checks the last closed session the next time the task runs. In this mode it does not ask the data source for live candles (after the close the saved data tells the story) and it places no orders.
 
 **Run it by hand (optional).** `python session_check.py` prints the same lines for today, in the middle of the session too (it then also asks the data source for live candles; skip that with `--no-live`); `--date YYYY-MM-DD` looks at an earlier day. It prints OK / CHECK / INFO lines for: whether it was a trading day; whether NIFTY and SENSEX live candles are fresh; the day's ideas, net result, alerts recorded and ideas skipped by a limit; what your database saved that day (candles, futures volume, option open interest) and the last collection runs, with failed runs flagged; and whether alerts, Angel One values, limits and the helper are set. Mid-session it can show harmless CHECK lines (only part of the day's candles are saved yet). It cannot see the dashboard's console messages, so it reports only what was recorded.
+
+---
+
+## 3e. Market news (publishers' RSS feeds)
+
+The dashboard keeps a local copy of market headlines so you can see what was happening around a move, and so history builds up for later study. **News is context only: no rule, alert or check uses it**, and it cannot be tested as a predictor until enough history is stored (a feed only offers its latest 10 to 60 stories).
+
+- **Where it comes from:** the publishers' own public RSS feeds, listed in `FEEDS` in `news_feed.py`: Mint (markets, companies), Economic Times (markets, top stories), Moneycontrol (top news), Business Standard (markets), BusinessLine (markets) and RBI (press releases). The `robots.txt` of each site allows these paths (checked when they were chosen). Add or remove feeds in that list; **check a publisher's terms before adding one.** RSS feeds are offered for syndication, and this project is for personal use.
+- **What is stored** (table `news` in `market_data.db`): the headline, a snippet of at most 300 characters, the publish time, the feed, and the link back to the article. The page shows the headline as a link to the publisher. Stories older than 365 days are removed (kept long on purpose: after a few months of saved headlines a news filter can finally be tested on the candle history; the feeds only show recent stories, so saving starts the day the dashboard first ran it and only continues while the dashboard is open).
+- **Polite fetching:** while the dashboard runs, a background loop looks every minute but asks each feed only when it is due: every 10 minutes during market hours (weekdays 9:00 to 16:00 IST), every hour otherwise. It uses conditional requests (ETag / Last-Modified) where a feed supports them, an honest User-Agent (`candle-signal-lab/1.0`), a 15 second timeout and a 2 MB limit, and a failing feed is not asked again before its normal time. One broken feed never stops the others. Use `--no-news` to switch the loop off. The 16:00 scheduled task also fetches once, so some history is kept on days the dashboard is not running (a feed only keeps its latest stories, so a long gap loses stories).
+- **Tags** are plain keyword rules (`TAG_RULES`): index, rbi, fed, inflation, gdp, budget, crude, rupee, fii, geopolitics, results, ipo, us market and big move. **Market-moving** means one of rbi, fed, inflation, gdp, budget, fii, geopolitics or a big move in an index / US market (one stock surging does not count). The rules are simple and sometimes wrong (for example a headline with the word "attack" gets the geopolitics tag); change them in `TAG_RULES` and run `python news_feed.py retag`.
+- **Telegram alerts for market-moving news:** while the dashboard runs, a new market-moving headline (the tags above) is sent as one message ("📰 MARKET NEWS": time, headline, publisher, tags, link). Rules: the first start only marks the stories already stored (no flood of old news); only stories published in the last 3 hours; a headline already sent is skipped, even from another publisher; at most 4 headlines per message (more are dropped, not queued); a story is marked as sent before it goes out, so never twice. It needs the Telegram settings (section 3c) and the dashboard running (the scheduled 16:00 fetch does not send alerts). **Information only: no trade idea or rule changes because of news.** Add `NEWS_ALERTS=off` to `.env` to switch them off. The tags are plain keywords and sometimes wrong, so some alerts will be about nothing important.
+- **On the page:** a **Market news** card (latest 15, filter All / Market-moving, when it was last checked and how many feeds answered) and the chart option **News** (off by default).
+- **Not an aggregator's feed:** an earlier idea was to use another site's news API. Its `robots.txt` disallows automated use of `/api/`, so it is not used; the same stories come from the publishers directly.
 
 ---
 
@@ -588,6 +625,58 @@ Question (raised by a losing SENSEX 84400 CE idea on 25 Nov 2026, whose 2 R targ
 
 ---
 
+## 7g. Trailing stop (`trailing_stop.py`): advice for a running idea
+
+When the price moves in your favour you may want to move your stop up so a winner cannot turn into a loser. The tool **tells you where**; it never places or changes an order. While an idea is running (entered, no result yet), the **Open ideas** card on the dashboard shows the stop to use now (an estimated option price, the highest price so far and what the stop locks in). A one-line Telegram message (section 3c) is sent for ideas that had a new-idea alert, each time the stop rises by at least Rs 3 (if the price jumps you get one message for the newest stop).
+
+The rule is fixed and not tuned, in option prices per unit:
+
+1. Keep the first stop until the option is **Rs 20** above your buy price.
+2. From then on the stop follows the **highest** option price seen, **Rs 15 below it**. It never moves down.
+
+The option-price numbers are estimates: a straight line between the idea's saved buy and target prices (no time decay, no curve). Your broker's real prices will differ. An idea saved without option prices gets no trailing stop (the card says so).
+
+**The journal and every test keep using the first stop.** The trailing stop only advises, so the paper results stay comparable with everything measured before. The older fixed ladder (`stop_ladder.py`) is no longer shown or sent.
+
+**What the one-year tests said about the trailing stop** (NIFTY and SENSEX, 5m and 15m, one lot, after a Rs 2 per share cost; the option is approximated with Black-Scholes, no time decay): trailing 15 below the highest after +20 earned between about -Rs 17,800 and +Rs 6,300 per market for the year, 0 of 12 strict gate tests passed (the 95% range always included 0 and none beat random entries), and adding a fixed target did not help. It protects gains and raises the number of winning trades; it did not raise the average result, and the entries have no proven edge.
+
+**What a one-year test said about the older fixed ladder** (the current rules, index R, 0.1 R cost, 546 trades over the four markets, same entries; not independent because NIFTY and SENSEX share days):
+
+
+| Stop rule | Average per trade | 95% range | Win rate (NIFTY 5m) |
+|---|---|---|---|
+| First stop only (today) | -0.061 R | -0.16 to +0.04 | 36% |
+| Breakeven after +1 R | -0.114 R | -0.20 to -0.02 | 27% |
+| Lock half of the best gain once +1 R | -0.061 R | -0.15 to +0.02 | 47% |
+| Trail 1 R behind the best price after +1 R | -0.082 R | -0.17 to +0.00 | 44% |
+| The older fixed ladder | -0.080 R | -0.16 to -0.00 | 33% |
+
+A ladder **raises the win rate but not the average**: what it saves on trades that reverse is lost on trades that would have continued to the target (breakeven stops are the worst, because noise stops you out at your entry). Of the 5-minute trades that ended at the first stop, 12 to 14% had been up +1 R first and 37 to 39% had been up +0.5 R first, so the gain to protect is modest. Use it for discipline and for protecting gains, not as a way to raise the average. It was tested on the index, not on option prices (the saved option history is too short), and on a trade that can gap through a stop (as a SENSEX option did on 25 Nov) the advised stop will not always fill.
+
+---
+
+## 7h. Market context, RSI, MACD and pivot levels (information only)
+
+**None of this changes a rule, a check or an alert.** It is the bigger picture around the current candle, so you can judge a setup yourself. The numbers are in `candle_context.py`; every one uses only finished days (except "today so far").
+
+**The Market context card** (tier 2). The daily candles are built from the saved intraday candles (the saved year, about 250 days):
+
+| Line | How it is worked out |
+|---|---|
+| Daily trend | Up when yesterday's close is above its 20-day EMA and that EMA is higher than 5 days ago; Down for the opposite; otherwise Sideways. Needs 25 finished days, otherwise no trend is claimed. Also shows the 5-day and 20-day change |
+| Last 5 days / Previous week | High and low of the last 5 finished days with where the price sits in that range; high, low and close of the previous calendar week |
+| Today's gap | Today's open against yesterday's close: "Gap up" / "Gap down" at 0.3% or more, otherwise "Flat open"; whether the gap has been filled yet; and whether the open was above, below or inside yesterday's range |
+| Yesterday | Colour, size in points and where it closed inside its own range |
+| Today so far | Range so far against the 14-day average daily range (ATR), and where the price sits in today's range |
+| Saved year | Distance from the saved high and low |
+| India VIX | The last close against its 5-day average: rising or falling at 5% or more, else flat. Uses the saved VIX when Yahoo's is not available |
+
+**RSI and MACD panels** (off by default, in the panels row). RSI is Wilder's RSI(14); MACD is the 12 / 26 EMA difference with a 9 EMA signal line. Both use only past candles, so an earlier point never changes when new candles arrive (tested). The experiments in the strategy lab do not use them: a rule would first have to pass the strict test of section 7.
+
+**Pivot levels** (chart option, off by default). The classic floor pivots from the previous day: P = (H+L+C)/3, R1 = 2P-L, S1 = 2P-H, R2 = P+(H-L), S2 = P-(H-L), R3 = H+2(P-L), S3 = L-2(H-P), plus the central pivot range (CPR); a narrow CPR is often read as a quiet day before a move, a wide one as a range day. This is a reading habit, not a tested rule.
+
+---
+
 ## 8. Idea history (success or failed)
 
 The "Trade idea" card clears when the next candle comes. The idea is NOT lost. Every idea is saved automatically in **Idea history** (the section below the chart) with:
@@ -698,6 +787,7 @@ ANGEL_TOTP_SECRET=
 | Problem | What to do |
 |---|---|
 | `ModuleNotFoundError: yfinance` or `flask` | Run `pip install pandas yfinance flask` (activate your virtual environment first). |
+| "Angel One returned no candles ... Invalid Token" (AG8001) | Angel One's login token expires (every day, or when you log in somewhere else), while a dashboard left running keeps the old one. The dashboard now logs in again by itself once and repeats the request, and prints "[angel] the login had expired: logged in again". If it still fails, your PIN or TOTP secret in `.env` is wrong, or Angel One has blocked the API key; restart the dashboard to see the login error. |
 | "Yahoo returned no data" | Check internet. Market may be closed. Try again in a few minutes. |
 | Dashboard opens but chart is empty | Check internet (chart library loads online). Read the red message at the top and the terminal. |
 | Latest candle looks old or flat | Yahoo free data is delayed. Use Angel One for live data. |

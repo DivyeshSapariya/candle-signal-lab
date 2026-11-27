@@ -36,6 +36,8 @@ import data_sources
 from option_pricer import build_option_levels, get_vix_daily, is_holiday
 from candle_analysis import live_analysis, rejected_setups
 import candle_chain
+import candle_context
+import news_feed
 import risk_limits
 import candle_store
 from candle_signals import compute_features, TRADE_START_MIN, TRADE_END_MIN, EXPIRY_CUTOFF_MIN
@@ -254,11 +256,23 @@ def build_payload(source: str, index: str, interval: str) -> dict:
             panels["oi_flow"] = _col(oi["oi_flow"] * 100, 2)
     except Exception as error:
         print(f"[chart] open interest panels not available: {error}")
+    close_all = analysed["close"]
+    panels["rsi"] = _col(candle_context.rsi(close_all), 1)
+    m = candle_context.macd(close_all)
+    panels["macd"], panels["macd_signal"], panels["macd_hist"] = _col(m["macd"], 2), _col(m["signal"], 2), _col(m["hist"], 2)
     last_day = analysed["day"].iloc[-1]
     day_rows = analysed[analysed["day"] == last_day]
     levels = {k: (None if pd.isna(analysed.iloc[-1][k]) else round(float(analysed.iloc[-1][k]), 2))
               for k in ("pdh", "pdl", "pdc", "or_high", "or_low", "swing_high", "swing_low", "gap_pct")}
     levels["day_open"] = round(float(day_rows["open"].iloc[0]), 2)
+    pivots = (candle_context.pivot_levels(levels["pdh"], levels["pdl"], levels["pdc"])
+              if all(levels.get(k) is not None for k in ("pdh", "pdl", "pdc")) else None)
+    try:                                                # plain information about the bigger picture; no rule uses it
+        market_context = candle_context.market_context(_daily_history(index, full), last_day, float(full["close"].iloc[-1]),
+                                                       vix_daily if vix_daily is not None else candle_store.load_vix())
+    except Exception as error:
+        print(f"[context] {error}")
+        market_context = None
 
     # --- arrows on the chart + list of recent patterns ---
     markers, recent = [], []
@@ -329,7 +343,29 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         chain = None
     t_chain = time.time() - t_mark
 
+    try:
+        news = _news_payload()
+    except Exception as error:                          # news must never break the dashboard
+        print(f"[news] {error}")
+        news = None
+
+    try:
+        open_ideas = journal.open_ideas()
+    except Exception as error:                          # advice must never break the dashboard
+        print(f"[stop advice] {error}")
+        open_ideas = []
+
     risk_cfg = risk_limits.settings()
+    for it in open_ideas:                                # display-only: rupees per lot at the FIRST stop, and the lots that fit
+        try:
+            adv = it["advice"]
+            if adv.get("buy_option") is not None and adv.get("first_stop_option") is not None:
+                loss_unit = round(float(adv["buy_option"]) - float(adv["first_stop_option"]), 2)
+                size = option_lot_size(it["index"].lower())
+                it["lot"] = risk_limits.per_lot(loss_unit, 0.0, size)
+                it["sizing"] = risk_limits.position_size(risk_cfg, loss_unit, size)
+        except Exception as error:
+            print(f"[lot size] {error}")
     try:
         risk = risk_limits.day_status(journal.today_stats(now.date()), risk_cfg)
     except Exception as error:
@@ -407,7 +443,7 @@ def build_payload(source: str, index: str, interval: str) -> dict:
                            now.isoformat(timespec="seconds"), option_levels_for,
                            should_alert, on_new_idea,
                            (lambda stats: risk_limits.check(stats, risk_cfg)) if risk_limits.limits_on(risk_cfg) else None)
-        journal.update_results(analysed, index, interval_min, on_finished)
+        journal.update_results(analysed, index, interval_min, on_finished, _send_trail_alert)
         journal_summary = journal.summary()
     except Exception as error:
         print(f"[journal] problem: {error}")
@@ -425,6 +461,8 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         "plan": plan,
         "analysis": analysis,
         "chain": chain,
+        "open_ideas": open_ideas,
+        "news": news,
         "timing": {"candles": round(t_candles, 2), "futures": round(t_futures, 2),
                    "vix": round(t_vix, 2), "chain": round(t_chain, 2), "total": round(time.time() - started, 2),
                    "angel": dict(data_sources.angel_stats, recent=list(data_sources.angel_recent[-14:]))},
@@ -436,6 +474,8 @@ def build_payload(source: str, index: str, interval: str) -> dict:
         "candles": candles,
         "lines": lines,
         "levels": levels,
+        "pivots": pivots,
+        "context": market_context,
         "zones": zones,
         "panels": panels,
         "markers": markers,
@@ -603,6 +643,12 @@ def _send_result_alert(info: dict) -> None:
     tg.send_async(tg.format_result(info))
 
 
+def _send_trail_alert(info: dict) -> None:
+    """Telegram advice to move the stop up (trailing stop). The journal calls it when the stop rose, only for alerted ideas."""
+    if tg.is_configured():
+        tg.send_async(tg.format_trail(info))
+
+
 def _update_waiting_ideas(source: str, watched: set, now: datetime) -> int:
     """
     Check the result of saved ideas whose market is NOT one the alert loop watches and that nobody has open
@@ -629,7 +675,7 @@ def _update_waiting_ideas(source: str, watched: set, now: datetime) -> int:
                 if len(finished) < 5:
                     continue
                 features = compute_features(finished, index, interval_min, get_vix_daily(), None)
-                journal.update_results(features, index, interval_min, _send_result_alert)
+                journal.update_results(features, index, interval_min, _send_result_alert, _send_trail_alert)
                 _waiting_seen[key] = (time.time(), {"latest": {"time": finished.index[-1].strftime("%d %b %H:%M")}})
                 done += 1
             except Exception as error:
@@ -699,6 +745,80 @@ def _alert_loop() -> None:
             except Exception as error:
                 print(f"[alerts] problem: {error}")
             time.sleep(ALERT_POLL_SECONDS)
+
+
+NEWS_LOOP_SECONDS = 60                # how often the loop LOOKS; each feed is only asked when it is due (news_feed.py)
+
+
+def _send_news_alerts() -> int:
+    """Telegram message for market-moving headlines that are new (one message per look). Off with NEWS_ALERTS=off."""
+    if not tg.is_configured() or str(os.environ.get("NEWS_ALERTS", "on")).strip().lower() in ("off", "0", "no", "false"):
+        return 0
+    con = candle_store.connect()
+    try:
+        items = news_feed.pending_alerts(con, int(time.time()))         # marked as handled before sending: never twice
+    finally:
+        con.close()
+    if items:
+        tg.send_async(tg.format_news(items))
+    return len(items)
+
+
+def _news_loop() -> None:
+    while True:
+        try:
+            news_feed.run_once()
+            _send_news_alerts()
+        except Exception as error:
+            print(f"[news] problem: {error}")
+        time.sleep(NEWS_LOOP_SECONDS)
+
+
+def start_news_loop() -> threading.Thread:
+    thread = threading.Thread(target=_news_loop, name="news-loop", daemon=True)
+    thread.start()
+    return thread
+
+
+_daily_cache = {}
+
+
+def _daily_history(index: str, live: pd.DataFrame) -> pd.DataFrame:
+    """Daily candles: the saved 5-minute history up to the first live day, then the live candles (cached for 10 minutes)."""
+    cached = _daily_cache.get(index)
+    if cached is None or time.time() - cached[0] > 600:
+        try:
+            saved = candle_context.daily_candles(candle_store.load_candles(index, "5m"))
+        except Exception as error:
+            print(f"[context] saved candles not readable: {error}")
+            saved = pd.DataFrame(columns=["open", "high", "low", "close"])
+        _daily_cache[index] = cached = (time.time(), saved)
+    now_daily = candle_context.daily_candles(live)
+    older = cached[1][cached[1].index < now_daily.index.min()] if len(now_daily) else cached[1]
+    return pd.concat([older, now_daily])
+
+
+_news_cache = {"at": 0.0, "value": None}
+
+
+def _news_payload() -> dict:
+    """The latest stored stories for the page, the market-moving ones of the last 3 days for the chart, and feed health."""
+    if _news_cache["value"] is not None and time.time() - _news_cache["at"] < 30:
+        return _news_cache["value"]
+    con = candle_store.connect()
+    try:
+        now = int(time.time())
+        status = news_feed.status(con)
+        ok = sum(1 for f in status["feeds"] if f["ok"])
+        checked = max((f["checked"] or 0) for f in status["feeds"]) if status["feeds"] else None
+        value = {"latest": news_feed.latest(con, 15),
+                 "marks": news_feed.latest(con, 40, important_only=True, since_ts=now - 3 * 86400),
+                 "feeds_ok": ok, "feeds": len(news_feed.FEEDS), "items": status["items"],
+                 "checked": (datetime.fromtimestamp(checked, IST).strftime("%H:%M") if checked else None)}
+    finally:
+        con.close()
+    _news_cache.update(at=time.time(), value=value)
+    return value
 
 
 def start_alert_loop() -> threading.Thread:
@@ -1000,6 +1120,20 @@ PAGE = r"""<!DOCTYPE html>
   .oi-facts { margin: 10px 0 0; padding: 10px 0 0 16px; border-top: 1px solid var(--line); font-size: 12px; line-height: 1.4; color: var(--soft); }
   .oi-facts li { margin: 0 0 2px; }
 
+  .news-item { padding: 6px 0; border-top: 1px solid var(--line); font-size: 12.5px; line-height: 1.35; }
+  .news-item:first-child { border-top: 0; }
+  .news-item .nt { font-family: var(--mono); font-size: 11.5px; color: var(--muted); margin-right: 6px; }
+  .news-item a { color: var(--text); text-decoration: none; }
+  .news-item a:hover { text-decoration: underline; }
+  .news-item .tg { display: inline-block; margin: 2px 4px 0 0; padding: 0 7px; border-radius: 999px; font-size: 10.5px; font-weight: 600;
+                   background: var(--surface2); color: var(--soft); }
+  .news-item .tg.imp { background: var(--amber-bg); color: var(--amber); }
+  #newsList { max-height: 420px; overflow-y: auto; }
+  .ladder-item { padding: 8px 0; border-top: 1px solid var(--line); font-size: 12.5px; line-height: 1.4; }
+  .ladder-item:first-child { border-top: 0; padding-top: 0; }
+  .ladder-item .adv { margin-top: 3px; padding: 6px 10px; border-radius: 8px; background: var(--surface2); }
+  .ladder-item .adv.moved { background: var(--green-bg); border: 1px solid var(--green-bd); }
+  .ladder-note { margin-top: 6px; font-size: 11.5px; color: var(--muted); line-height: 1.4; }
   #riskLine:empty { display: none; }
   #riskLine { margin-bottom: 10px; font-size: 12.5px; color: var(--soft); }
   #riskLine .box { margin-top: 6px; }
@@ -1141,6 +1275,10 @@ PAGE = r"""<!DOCTYPE html>
   <!-- TIER 2: context -->
   <div class="tier top">
     <div class="col t2a">
+      <section class="card" id="cardContext" aria-label="Market context" style="display:none">
+        <h3>Market context <span class="hint">plain information, no rule uses it</span></h3>
+        <div id="ctxBody"></div>
+      </section>
       <section class="card" aria-label="Recent candle patterns">
         <h3>Recent candle patterns</h3>
         <div id="recent" class="list muted">--</div>
@@ -1153,6 +1291,10 @@ PAGE = r"""<!DOCTYPE html>
       </section>
     </div>
     <div class="col t2c">
+      <section class="card" id="cardOpen" aria-label="Open ideas" style="display:none">
+        <h3>Open ideas <span class="hint">stop advice, you place the orders</span></h3>
+        <div id="openIdeas"></div>
+      </section>
       <section class="card" aria-label="Paper-trade scoreboard">
         <h3>Paper-trade scoreboard <span class="hint">automatic, no real money</span></h3>
         <div id="riskLine"></div>
@@ -1186,6 +1328,15 @@ PAGE = r"""<!DOCTYPE html>
       </section>
     </div>
     <div class="col t3b">
+      <section class="card" id="cardNews" aria-label="Market news" style="display:none">
+        <h3>Market news <span class="hint" id="newsMeta"></span></h3>
+        <div class="chips" id="newsChips" role="group" aria-label="Filter news">
+          <button class="chip" data-f="ALL" type="button">All</button>
+          <button class="chip" data-f="IMPORTANT" type="button">Market-moving</button>
+        </div>
+        <div id="newsList"></div>
+        <div class="ladder-note">Headlines and links from the publishers' public RSS feeds, kept in your own database. Context only: no rule or alert uses news.</div>
+      </section>
       <section class="card" id="cardRejected" aria-label="Recent setups with no idea">
         <h3>Recent setups with no idea <span class="hint">a pattern appeared, but a rule said no</span></h3>
         <div id="rejected" class="list muted">--</div>
@@ -1277,11 +1428,13 @@ const CHART_OPTS = [
   { key: 'prev', label: 'Previous day', color: '#9aa8b6', on: false },
   { key: 'orange', label: 'Opening range', color: '#7ee8d6', on: false },
   { key: 'swing', label: 'Swing high / low', color: '#6d8bb0', on: false },
+  { key: 'pivots', label: 'Pivot levels', color: '#c9a0ff', on: false },
   { key: 'walls', label: 'OI walls', color: '#ff7a70', on: false },
   { key: 'arrows', label: 'Pattern arrows', color: '#2bd4b4', on: true },
   { key: 'signal', label: 'Signal candle', color: '#f3b94d', on: true },
   { key: 'ideas', label: 'Past ideas', color: '#9aa8b6', on: true },
   { key: 'zones', label: 'No-trade zones', color: '#8794a3', on: true },
+  { key: 'news', label: 'News', color: '#f3b94d', on: false },
   { key: 'dayopen', label: 'Day open', color: '#8794a3', on: false },
   { key: 'rr', label: 'Risk / reward zone', color: '#2bd4b4', on: true },
   { key: 'p_adx', label: 'ADX panel', color: '#b48bff', on: false },
@@ -1289,6 +1442,8 @@ const CHART_OPTS = [
   { key: 'p_volx', label: 'Volume panel', color: '#4da3ff', on: false },
   { key: 'p_oipcr', label: 'OI ratio panel', color: '#7ee8d6', on: false },
   { key: 'p_oiflow', label: 'OI build-up panel', color: '#ff7a70', on: false },
+  { key: 'p_rsi', label: 'RSI panel', color: '#4da3ff', on: false },
+  { key: 'p_macd', label: 'MACD panel', color: '#b48bff', on: false },
 ];
 // small panels under the chart, lined up with it (one chart each, zoom follows the main chart)
 const PANELS = [
@@ -1297,6 +1452,9 @@ const PANELS = [
   { key: 'p_volx', data: 'volx', title: 'Futures volume, times its recent average (optional check: 1 or more)', kind: 'hist', color: '#4da3ff', ref: 1, refTitle: '1x' },
   { key: 'p_oipcr', data: 'oi_pcr', title: 'Put/call OI ratio (saved OI days only)', kind: 'line', color: '#7ee8d6', ref: 1, refTitle: '1' },
   { key: 'p_oiflow', data: 'oi_flow', title: 'OI build-up %, puts minus calls over 30 min (saved OI days only)', kind: 'hist2', color: '#ff7a70', ref: 0, refTitle: '0' },
+  { key: 'p_rsi', data: 'rsi', title: 'RSI 14 (information only; 70 and 30 are the usual marks)', kind: 'line', color: '#4da3ff',
+    refs: [{ price: 70, title: '70' }, { price: 30, title: '30' }], range: [0, 100] },
+  { key: 'p_macd', data: 'macd_hist', title: 'MACD 12/26/9: histogram, MACD line (blue), signal line (amber) (information only)', kind: 'macd', color: '#b48bff', refs: [{ price: 0, title: '0' }] },
 ];
 const subCharts = {};
 let rrSeries = [];
@@ -1312,6 +1470,24 @@ function setIndicatorLines(l) {
 }
 // marks for the idea shown now (signal + confirmation candle) and for the ideas saved in the journal
 const chartTime = (iso) => Math.round(Date.parse(iso) / 1000) + 19800;
+// market-moving headlines as small markers on the candle they were published in (the last 3 days; only with the News option)
+function newsMarkers() {
+  const out = [], n = lastData && lastData.news, c = lastData && lastData.candles;
+  if (!opts.news || !n || !c || !c.length) return out;
+  const by = new Map();
+  (n.marks || []).forEach((it) => {
+    const t = it.published + 19800;
+    if (t < c[0].time || t > c[c.length - 1].time + 3600) return;
+    let lo = 0, hi = c.length - 1;                                   // the last candle that started at or before the headline
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (c[mid].time <= t) lo = mid; else hi = mid - 1; }
+    const tag = (it.tags.find((x) => !['index', 'big_move'].includes(x)) || it.tags[0] || 'news').toUpperCase();
+    const key = c[lo].time;
+    if (!by.has(key)) by.set(key, new Set());
+    by.get(key).add(tag);
+  });
+  by.forEach((tags, time) => out.push({ time: time, position: 'aboveBar', shape: 'circle', color: '#f3b94d', size: 1, text: [...tags].slice(0, 2).join(' ') }));
+  return out;
+}
 const IDEA_COLORS = { 'SUCCESS': '#2bd4b4', 'FAILED': '#ff7a70', 'TIME EXIT': '#f3b94d' };
 function ideaMarkers() {
   const out = [];
@@ -1336,7 +1512,7 @@ function applyChartOpts() {
   ema9Series.applyOptions({ visible: opts.ema9 });
   ema21Series.applyOptions({ visible: opts.ema21 });
   vwapSeries.forEach((x) => x.applyOptions({ visible: opts.vwap }));
-  const marks = (lastData && opts.arrows ? lastData.markers : []).concat(lastData ? ideaMarkers() : []);
+  const marks = (lastData && opts.arrows ? lastData.markers : []).concat(lastData ? ideaMarkers() : []).concat(newsMarkers());
   series.setMarkers(marks.sort((a, b) => a.time - b.time));
   levelLines.forEach((x) => series.removePriceLine(x));
   levelLines = [];
@@ -1356,6 +1532,14 @@ function applyChartOpts() {
   if (opts.prev) { add(lv.pdh, '#9aa8b6', 'PD high', 2); add(lv.pdl, '#9aa8b6', 'PD low', 2); add(lv.pdc, '#9aa8b6', 'PD close', 1); }
   if (opts.orange) { add(lv.or_high, '#7ee8d6', 'OR high', 2); add(lv.or_low, '#7ee8d6', 'OR low', 2); }
   if (opts.swing) { add(lv.swing_high, '#6d8bb0', 'Swing high', 1); add(lv.swing_low, '#6d8bb0', 'Swing low', 1); }
+  if (opts.pivots && lastData.pivots) {
+    const pv = lastData.pivots;
+    ['R3', 'R2', 'R1'].forEach((k) => add(pv[k], '#ff7a70', k, 1));
+    add(pv.P, '#c9a0ff', 'Pivot', 0);
+    ['S1', 'S2', 'S3'].forEach((k) => add(pv[k], '#2bd4b4', k, 1));
+    add(pv.cpr_top, '#c9a0ff', 'CPR top', 2);
+    add(pv.cpr_bottom, '#c9a0ff', 'CPR bottom', 2);
+  }
   if (opts.walls && ch) {
     if (ch.call_wall) add(ch.call_wall.strike, '#ff7a70', 'Call wall', 3);
     if (ch.put_wall) add(ch.put_wall.strike, '#2bd4b4', 'Put wall', 3);
@@ -1392,6 +1576,15 @@ function panelData(def) {
     return out;
   });
 }
+// the three MACD series, one point per candle (an empty point where there is no value yet)
+function alignedLine(key) {
+  const m = new Map(((lastData.panels || {})[key] || []).map((x) => [x.time, x.value]));
+  return lastData.candles.map((c) => (m.has(c.time) ? { time: c.time, value: m.get(c.time) } : { time: c.time }));
+}
+function macdHistogram() {
+  return alignedLine('macd_hist').map((x) => (x.value === undefined ? x
+    : Object.assign(x, { color: x.value >= 0 ? 'rgba(43,212,180,0.75)' : 'rgba(255,122,112,0.75)' })));
+}
 function drawPanels() {
   const host = $('subPanels');
   PANELS.forEach((def) => {
@@ -1400,7 +1593,7 @@ function drawPanels() {
       if (entry) { entry.chart.remove(); entry.box.remove(); delete subCharts[def.key]; }
       return;
     }
-    const data = panelData(def), has = data.some((x) => x.value !== undefined);
+    const data = def.kind === 'macd' ? macdHistogram() : panelData(def), has = data.some((x) => x.value !== undefined);
     let e = entry;
     if (!e) {
       const box = h('div', 'subpanel', null, [h('div', 'subtitle', def.title), h('div', 'subchart')]);
@@ -1408,15 +1601,25 @@ function drawPanels() {
       const c = LightweightCharts.createChart(box.lastChild, Object.assign({ autoSize: true, handleScroll: false, handleScale: false,
         crosshair: { mode: 0 } }, chartOptions(THEMES[theme])));
       c.applyOptions({ timeScale: { visible: false } });
+      const fixed = def.range ? { autoscaleInfoProvider: () => ({ priceRange: { minValue: def.range[0], maxValue: def.range[1] } }) } : {};
       const ser = def.kind === 'line'
-        ? c.addLineSeries({ color: def.color, lineWidth: 2, priceLineVisible: false, lastValueVisible: true })
+        ? c.addLineSeries(Object.assign({ color: def.color, lineWidth: 2, priceLineVisible: false, lastValueVisible: true }, fixed))
         : c.addHistogramSeries({ color: def.color, priceLineVisible: false, lastValueVisible: false });
-      ser.createPriceLine({ price: def.ref, color: '#8794a3', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: def.refTitle });
+      (def.refs || [{ price: def.ref, title: def.refTitle }]).forEach((r) =>
+        ser.createPriceLine({ price: r.price, color: '#8794a3', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: r.title }));
       e = subCharts[def.key] = { chart: c, series: ser, box: box };
+      if (def.kind === 'macd') {
+        e.line = c.addLineSeries({ color: '#4da3ff', lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
+        e.sig = c.addLineSeries({ color: '#f3b94d', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+      }
       const range = chart.timeScale().getVisibleLogicalRange();
       if (range) c.timeScale().setVisibleLogicalRange(range);
     }
     e.series.setData(data);
+    if (def.kind === 'macd') {
+      e.line.setData(alignedLine('macd'));
+      e.sig.setData(alignedLine('macd_signal'));
+    }
     let note = e.box.querySelector('.nodata');
     if (!has && !note) { note = h('div', 'nodata', 'No data for the days on screen yet.'); e.box.appendChild(note); }
     if (has && note) note.remove();
@@ -1755,6 +1958,113 @@ function renderTrade(d) {
   if (rm) addLine(rm.price, '#9aa8b6', 'NEXT LEVEL');
 }
 
+// ---------------- market context (daily trend, last week, gap, ...; plain information) ----------------
+function renderContext(d) {
+  const card = $('cardContext'), box = clear($('ctxBody')), c = d.context;
+  if (!c) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  const pct = (v) => (v === null || v === undefined ? '--' : (v >= 0 ? '+' : '') + v.toFixed(1) + '%');
+  const kvx = (k, v, cls) => kv(box, k, v, cls);
+  if (c.trend) {
+    const cls = c.trend.label === 'Up' ? 'up' : c.trend.label === 'Down' ? 'down' : '';
+    kvx('Daily trend', c.trend.label, cls);
+    box.appendChild(h('div', 'muted small', 'Yesterday\'s close is ' + Math.abs(c.trend.vs_ema_pct).toFixed(1) + '% ' + (c.trend.vs_ema_pct >= 0 ? 'above' : 'below') +
+      ' its 20-day average (' + fmt(c.trend.ema20) + '); ' + pct(c.trend.change_5d_pct) + ' in 5 days, ' + pct(c.trend.change_20d_pct) + ' in 20 days.'));
+  } else {
+    kvx('Daily trend', 'not enough history');
+  }
+  if (c.week) {
+    const w = c.week;
+    kvx('Last 5 days', fmt(w.low_5d) + ' to ' + fmt(w.high_5d) + (w.position_pct === null ? '' : ' \u00B7 price at ' + w.position_pct + '% of it'));
+    if (w.prev_week_high !== undefined) kvx('Previous week', 'high ' + fmt(w.prev_week_high) + ' \u00B7 low ' + fmt(w.prev_week_low) + ' \u00B7 close ' + fmt(w.prev_week_close));
+  }
+  if (c.gap) {
+    const g = c.gap, cls = g.label === 'Gap up' ? 'up' : g.label === 'Gap down' ? 'down' : '';
+    kvx('Today\'s gap', g.label + ' ' + pct(g.pct) + (g.filled === null ? '' : g.filled ? ', filled' : ', not filled yet'), cls);
+    box.appendChild(h('div', 'muted small', 'Opened ' + g.open_vs_prev + ' (previous close ' + fmt(g.prev_close) + ').'));
+  }
+  if (c.prev_day) {
+    const p = c.prev_day;
+    kvx('Yesterday', p.color + ' candle \u00B7 ' + Math.round(p.range) + ' pts' + (p.close_location_pct === null ? '' : ' \u00B7 closed at ' + p.close_location_pct + '% of its range'), p.color === 'green' ? 'up' : 'down');
+  }
+  if (c.today) {
+    const t = c.today;
+    kvx('Today so far', Math.round(t.range) + ' pts' + (t.range_vs_atr === null ? '' : ' (' + t.range_vs_atr + 'x the 14-day average)') + (t.position_pct === null ? '' : ' \u00B7 price at ' + t.position_pct + '% of the range'));
+  }
+  if (c.year) kvx('Saved year (' + c.year.days + ' days)', pct(c.year.from_high_pct) + ' from the high \u00B7 ' + pct(c.year.from_low_pct) + ' from the low');
+  if (c.vix) kvx('India VIX', c.vix.last.toFixed(1) + ' \u00B7 ' + c.vix.label + ' (5-day average ' + c.vix.avg5.toFixed(1) + ')');
+  const pv = d.pivots;
+  if (pv) {
+    box.appendChild(h('div', 'group', 'Pivot levels from yesterday'));
+    box.appendChild(h('div', 'small', 'R3 ' + fmt(pv.R3) + ' \u00B7 R2 ' + fmt(pv.R2) + ' \u00B7 R1 ' + fmt(pv.R1)));
+    box.appendChild(h('div', 'small', 'Pivot ' + fmt(pv.P) + ' \u00B7 CPR ' + fmt(pv.cpr_bottom) + ' to ' + fmt(pv.cpr_top) + ' (' + pv.cpr_width_pct + '% wide)'));
+    box.appendChild(h('div', 'small', 'S1 ' + fmt(pv.S1) + ' \u00B7 S2 ' + fmt(pv.S2) + ' \u00B7 S3 ' + fmt(pv.S3)));
+  }
+}
+
+// ---------------- market news (stored from the publishers' RSS feeds) ----------------
+let newsFilter = store.get('cs.newsFilter', 'ALL') === 'IMPORTANT' ? 'IMPORTANT' : 'ALL';
+function renderNews(d) {
+  const card = $('cardNews'), box = clear($('newsList')), n = d.news;
+  if (!n) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  $('newsMeta').textContent = n.checked ? '\u00B7 checked ' + n.checked + ' \u00B7 ' + n.feeds_ok + ' of ' + n.feeds + ' feeds ok' : '\u00B7 not fetched yet';
+  document.querySelectorAll('#newsChips .chip').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.f === newsFilter)));
+  const list = (n.latest || []).filter((it) => newsFilter === 'ALL' || it.important);
+  if (!list.length) { box.appendChild(h('div', 'muted small', newsFilter === 'ALL' ? 'No stories stored yet. They arrive within a few minutes.' : 'No market-moving story among the latest ones.')); return; }
+  list.forEach((it) => {
+    const a = h('a', null, it.title);
+    a.href = it.link; a.target = '_blank'; a.rel = 'noopener noreferrer';
+    const tags = h('div', null, null, it.tags.filter((t) => t !== 'index').map((t) => h('span', 'tg' + (['rbi', 'fed', 'inflation', 'gdp', 'budget', 'fii', 'geopolitics', 'big_move'].includes(t) ? ' imp' : ''), t.replace('_', ' '))));
+    box.appendChild(h('div', 'news-item', null, [
+      h('div', null, null, [h('span', 'nt', it.date + ' ' + it.time), a, document.createTextNode('  \u00B7 ' + it.source)]),
+      it.tags.length ? tags : null,
+    ]));
+  });
+}
+document.querySelectorAll('#newsChips .chip').forEach((b) => b.addEventListener('click', () => {
+  newsFilter = b.dataset.f; store.set('cs.newsFilter', newsFilter); if (lastData) renderNews(lastData);
+}));
+
+// ---------------- open ideas: where to keep your stop (trailing stop, advice only) ----------------
+function renderOpenIdeas(d) {
+  const card = $('cardOpen'), box = clear($('openIdeas')), list = d.open_ideas || [];
+  card.style.display = list.length ? '' : 'none';
+  if (!list.length) return;
+  list.forEach((it) => {
+    const a = it.advice, moved = !!a.active;
+    let advLine, nextLine;
+    if (!a.has_prices) {
+      advLine = [document.createTextNode('No option prices were saved for this idea, so the trailing stop cannot be worked out.')];
+      nextLine = 'Keep your first stop.';
+    } else if (moved) {
+      advLine = [h('b', null, 'Move your stop to ' + rs(a.stop_option)),
+                 document.createTextNode(' \u00B7 highest price so far ' + rs(a.high_option) + ' \u00B7 locks about ' + rs(a.locks) + ' per unit'
+                   + (it.lot ? ' (' + rs(a.locks * it.lot.size) + ' per lot)' : ''))];
+      nextLine = 'The stop follows the highest price, 15 rupees below it, and never moves down.';
+    } else {
+      advLine = [document.createTextNode('Keep your first stop at ' + rs(a.first_stop_option))];
+      nextLine = 'Trailing starts when the option reaches ' + rs(a.start_option) + ' (buy +20 rupees). Highest so far ' + rs(a.high_option) + '.';
+    }
+    let lotLine = null;                                  // lot size: loss at the FIRST stop for one lot, and the lots that fit your budget
+    if (it.lot) {
+      const z = it.sizing;
+      lotLine = h('div', 'muted small', 'Lot size ' + it.lot.size + ' · loss at the first stop about ' + rs(it.lot.loss) + ' per lot'
+        + (z ? ' · budget ' + rs(z.budget) + ' → ' + (z.lots ? z.lots + ' lot' + (z.lots === 1 ? '' : 's') + ' fit' : 'even 1 lot is more than your budget') : ''));
+    }
+    box.appendChild(h('div', 'ladder-item', null, [
+      h('div', null, null, [h('b', null, it.option), document.createTextNode('  \u00B7 ' + it.index + ' ' + it.interval + ' \u00B7 ' + it.date + ' ' + it.time)]),
+      h('div', 'muted small', 'Bought near index ' + fmt(it.fill) + ' \u00B7 best gain so far ' + (a.peak_r >= 0 ? '+' : '') + a.peak_r + ' R'),
+      lotLine,
+      h('div', 'adv' + (moved ? ' moved' : ''), null, advLine),
+      h('div', 'muted small', nextLine),
+    ]));
+  });
+  box.appendChild(h('div', 'ladder-note', 'Trailing stop: the first stop stays until the option is 20 rupees above your buy price; then the stop follows the highest price, 15 rupees below it. '
+    + 'In a one-year test it protected gains but did not raise the average result. '
+    + 'Advice only. The paper results still use the first stop. Option prices are estimates.'));
+}
+
 // ---------------- daily risk limits (only shown when set in .env) ----------------
 function renderRisk(d) {
   const box = clear($('riskLine')), r = d.risk;
@@ -1871,6 +2181,9 @@ function render(d) {
   renderAnalysis(d);
   renderChain(d);
   renderRisk(d);
+  renderOpenIdeas(d);
+  renderNews(d);
+  renderContext(d);
   renderWhy(d);
   renderTrade(d);
   renderJournal(d.journal);
@@ -2109,6 +2422,8 @@ if __name__ == "__main__":
                         help="do not restart automatically when a .py file changes")
     parser.add_argument("--no-alerts", action="store_true",
                         help="do not run the background Telegram alert loop")
+    parser.add_argument("--no-news", action="store_true",
+                        help="do not fetch market news from the publishers' RSS feeds")
     args = parser.parse_args()
 
     url = f"http://127.0.0.1:{args.port}"
@@ -2125,4 +2440,6 @@ if __name__ == "__main__":
     # so there is exactly one loop.
     if (restarted_copy or args.no_reload) and not args.no_alerts and tg.is_configured():
         start_alert_loop()
+    if (restarted_copy or args.no_reload) and not args.no_news:
+        start_news_loop()
     app.run(host="127.0.0.1", port=args.port, debug=False, use_reloader=not args.no_reload)

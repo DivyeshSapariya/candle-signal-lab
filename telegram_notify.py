@@ -124,14 +124,16 @@ def _call(method: str, payload: dict, token: str) -> dict:
     return body
 
 
-def send_message(text: str, chat_id: str = None, token: str = None) -> None:
-    """Send one message and wait for the answer. Raises TelegramError if it fails."""
+def send_message(text: str, chat_id: str = None, token: str = None, parse_mode: str = None) -> None:
+    """Send one message and wait for the answer. Raises TelegramError if it fails. parse_mode="HTML" allows <b>bold</b>."""
     token = token or _setting("TELEGRAM_BOT_TOKEN")
     chat_id = chat_id or _setting("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         raise TelegramError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are not set")
-    _call("sendMessage", {"chat_id": chat_id, "text": text[:MAX_TEXT],
-                          "disable_web_page_preview": True}, token)
+    payload = {"chat_id": chat_id, "text": text[:MAX_TEXT], "disable_web_page_preview": True}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    _call("sendMessage", payload, token)
 
 
 def send_async(text: str, attempts: int = 2) -> threading.Thread:
@@ -227,6 +229,67 @@ def format_idea(idea: dict, option_levels: dict = None, memory: dict = None, set
     nxt = _next_level_line(idea)
     if nxt:
         lines += ["", nxt]
+    return "\n".join(lines)
+
+
+def format_ladder(info: dict) -> str:
+    """
+    Advice to move the stop loss up (stop ladder). info: option, side, index, interval, advice, before
+    (from candle_journal.update_results). Short, like the other messages. Advice only.
+    """
+    adv, old = info["advice"], info["before"]
+    lines = [f"🔔 MOVE STOP LOSS - {info.get('option', '')}",
+             f"{str(info.get('index', '')).upper()} {info.get('interval', '')} candles | best gain so far {adv['peak_r']:+.1f} R".replace("  ", " "),
+             ""]
+    if adv.get("stop_option") is not None:
+        lines.append(f"New stop loss - {_rs(adv['stop_option'])}")
+        if old.get("stop_option") is not None:
+            lines.append(f"Old stop loss - {_rs(old['stop_option'])}")
+    else:
+        lines.append(f"New stop loss - {_num(adv['stop_index'])} (index)")
+        lines.append(f"Old stop loss - {_num(old['stop_index'])} (index)")
+    lock = adv.get("lock_r") or 0.0
+    if lock <= 0:
+        lines.append("If it is hit - you leave near your buy price")
+    elif adv.get("stop_option") is not None and adv.get("buy_option") is not None:
+        lines.append(f"If it is hit - you keep about {_rs(adv['stop_option'] - adv['buy_option'])} per unit (+{lock:g} R)")
+    else:
+        lines.append(f"If it is hit - you keep about +{lock:g} R")
+    nxt = adv.get("next")
+    if nxt:
+        lines.append(f"Next step - at index {_num(nxt['at_index'])} (+{nxt['at_r']:g} R)")
+    lines += ["", "Advice only: change the order yourself."]
+    return "\n".join(lines)
+
+
+def _price(value) -> str:
+    """An option price without useless zeros: 252, 252.4, 252.35."""
+    return f"{float(value):.2f}".rstrip("0").rstrip(".")
+
+
+def format_trail(info: dict) -> str:
+    """
+    One line when the trailing stop moves up (trailing_stop.py), for example
+        SENSEX 84400 CE - SL 252 ------ OLD SL 248 | MP 260
+    SL = the stop to use now, OLD SL = the one before, MP = the option's market price now (an estimate). Advice only.
+    info: option, advice (from trailing_stop.advice), old_stop.
+    """
+    adv = info["advice"]
+    text = f"{info.get('option', '')} - SL {_price(adv['stop_option'])} ------ OLD SL {_price(info['old_stop'])}"
+    if adv.get("now_option") is not None:
+        text += f" | MP {_price(adv['now_option'])}"
+    return text
+
+
+def format_news(items: list) -> str:
+    """Market-moving headlines (news_feed.pending_alerts). Context only: it is not a trade signal."""
+    lines = ["📰 MARKET NEWS" + (f" ({len(items)})" if len(items) > 1 else "")]
+    for it in items:
+        tags = ", ".join(t.replace("_", " ") for t in it.get("tags", []) if t != "index")
+        lines += ["", f"{it['time']} - {it['title']}", f"{it['source']}" + (f" | {tags}" if tags else "")]
+        if it.get("link"):
+            lines.append(it["link"])
+    lines += ["", "For information only. No trade idea changes because of news."]
     return "\n".join(lines)
 
 

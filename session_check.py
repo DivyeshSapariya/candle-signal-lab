@@ -25,7 +25,10 @@ It reports, in plain lines marked OK / CHECK / INFO:
 """
 
 import argparse
+import html
+import json
 import os
+import re
 import sqlite3
 from datetime import date, datetime, timedelta
 
@@ -89,6 +92,63 @@ def journal_lines(df: pd.DataFrame, day: date) -> list:
     waiting = int(mine["status"].isin(["PENDING", "OPEN"]).sum())
     if waiting:
         lines.append((CHECK, f"{waiting} idea(s) still waiting / running: results are checked while the dashboard is open."))
+    return lines
+
+
+def idea_money_lines(df: pd.DataFrame, day: date, lot_size=None, cfg: dict = None) -> list:
+    """
+    The day's ideas one per line for the Telegram summary, the result in RUPEES (not R) for the lots you would have taken:
+        - 10:35 SENSEX 84400 CE 5m: LOSS ₹1,601 Total(1 LOT)
+    Rupees come from the saved option prices at the target or the stop loss (a time exit is approximate: "about"), times the
+    lot size. LOTS = how many lots your risk budget allows (RISK_CAPITAL and RISK_PER_TRADE_PCT, the position-size helper),
+    at least 1; without those settings it is 1 lot. Before brokerage, taxes and the bid-ask gap. Ideas skipped by a daily
+    limit are left out. lot_size = function(index) -> lot size or None (default: Angel One's list); cfg = risk settings.
+    """
+    if df is None or df.empty:
+        return []
+    mine = df[[pd.Timestamp(t).date() == day for t in df["signal_time"]]]
+    mine = mine[~mine["note"].astype(str).str.startswith("Daily limit")]
+    mine = mine[mine["status"].isin(["TARGET", "STOP", "TIME", "OPEN", "PENDING"])]
+    if mine.empty:
+        return []
+    if lot_size is None:
+        from data_sources import option_lot_size as lot_size
+    if cfg is None:
+        import risk_limits
+        cfg = risk_limits.settings()
+    import risk_limits
+    lines, total, counted = [], 0.0, 0
+    for _, row in mine.sort_values("signal_time").iterrows():
+        status = row["status"]
+        head = f"- {pd.Timestamp(row['signal_time']):%H:%M} {row['option']} {row['interval']}: "
+        if status in ("OPEN", "PENDING"):
+            lines.append(head + ("RUNNING" if status == "OPEN" else "WAITING"))
+            continue
+        try:
+            levels = json.loads(row["option_levels"]) if row["option_levels"] else None
+            size = lot_size(str(row["index"]).lower())
+        except Exception:
+            levels, size = None, None
+        if not levels or not size:
+            lines.append(head + f"{status} (rupees not known: no option price or lot size saved)")
+            continue
+        approx = False
+        if status == "TARGET":
+            unit = float(levels["profit_per_unit"])
+        elif status == "STOP":
+            unit = -float(levels["loss_per_unit"])
+        else:                                                  # a time exit ended between the two: an approximation
+            gross = float(row["r"] or 0.0)
+            unit = gross * float(levels["loss_per_unit"]) if gross < 0 else gross * float(levels["profit_per_unit"]) / 2.0
+            approx = True
+        sizing = risk_limits.position_size(cfg, float(levels["loss_per_unit"]), size)
+        lots = max(1, sizing["lots"]) if sizing else 1
+        money = unit * size * lots
+        total += money
+        counted += 1
+        lines.append(head + f"{'PROFIT' if money >= 0 else 'LOSS'} {'about ' if approx else ''}₹{abs(money):,.0f} Total({lots} LOT)")
+    if counted:
+        lines.append(f"Day total: {'PROFIT' if total >= 0 else 'LOSS'} ₹{abs(total):,.0f} (before brokerage and taxes)")
     return lines
 
 
@@ -183,17 +243,39 @@ def report_path(day: date, folder: str = REPORT_DIR) -> str:
     return os.path.join(folder, f"session_check_{day.isoformat()}.txt")
 
 
-def telegram_summary(day: date, sections: list, problems: int) -> str:
-    """A short message: the day's ideas and results, and every item that needs a look."""
+def _bold_money(line: str) -> str:
+    """HTML for one idea line: a coloured dot and the LOSS / PROFIT word with its amount in bold, so it stands out."""
+    line = html.escape(line, quote=False)
+    return re.sub(r"(PROFIT|LOSS)( about)? (\u20b9[\d,]+)",
+                  lambda m: ("🟢 " if m.group(1) == "PROFIT" else "🔴 ") + f"<b>{m.group(1)}{m.group(2) or ''} {m.group(3)}</b>", line)
+
+
+def telegram_summary(day: date, sections: list, problems: int, ideas: list = None, as_html: bool = False) -> str:
+    """A short message: the day's ideas and results, and every item that needs a look. as_html: LOSS / PROFIT in bold (Telegram HTML)."""
     lines = [f"End-of-day check, {day:%a %d %b %Y}"]
     for title, section in sections:
         if title == "Journal":
             lines += [text for _, text in section]
+    if ideas:
+        lines += ["", "Ideas in rupees:"] + ideas
+        ideas_at = len(lines) - len(ideas)
     flagged = [text for _, section in [(t, ls) for t, ls in sections] for flag, text in section if flag == CHECK]
     lines.append("")
     lines += ([f"{problems} item(s) to check:"] + [f"- {t}" for t in flagged]) if problems else ["Nothing to check."]
     lines.append("Full report: reports/session_check_" + day.isoformat() + ".txt")
+    if as_html:
+        lines = [_bold_money(t) if ideas and ideas_at <= k < ideas_at + len(ideas) else html.escape(t, quote=False) for k, t in enumerate(lines)]
     return "\n".join(lines)
+
+
+def _ideas_in_rupees(day: date) -> list:
+    """The rupee lines for the Telegram summary. Never stops the summary: on any problem it is simply left out."""
+    try:
+        import candle_journal
+        return idea_money_lines(candle_journal._load(), day)
+    except Exception as error:
+        print(f"[session check] ideas in rupees not added: {error}")
+        return []
 
 
 def run_auto(now: datetime, db: str = "market_data.db", folder: str = REPORT_DIR, force: bool = False, send=True):
@@ -217,7 +299,11 @@ def run_auto(now: datetime, db: str = "market_data.db", folder: str = REPORT_DIR
     print(text)
     if send and tg.is_configured():
         try:
-            tg.send_message(telegram_summary(day, sections, problems))
+            ideas = _ideas_in_rupees(day)
+            try:                                          # LOSS / PROFIT in bold; plain text if Telegram refuses the markup
+                tg.send_message(telegram_summary(day, sections, problems, ideas, as_html=True), parse_mode="HTML")
+            except Exception:
+                tg.send_message(telegram_summary(day, sections, problems, ideas))
         except Exception as error:                      # the report is saved either way
             print(f"[telegram] summary not sent: {error}")
     return path

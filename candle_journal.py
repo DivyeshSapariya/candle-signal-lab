@@ -29,6 +29,7 @@ import pandas as pd
 import candle_memory
 from candle_backtest import COST_R, simulate_trade
 from candle_signals import evaluate, pretty
+import trailing_stop
 
 JOURNAL_FILE = "trade_journal.csv"
 SNAPSHOT_DIR = "trade_snapshots"
@@ -200,14 +201,41 @@ def _write_snapshot(f: pd.DataFrame, i: int, res: dict, row) -> None:
         json.dump(snap, fh)
 
 
-def update_results(f: pd.DataFrame, index: str, interval_min: int, on_finished=None):
+def _trail_done(alerts: str):
+    """The trailing stop (option price) last announced for an idea: the alerts column holds a token like trail=252.40."""
+    for token in str(alerts).split(","):
+        if token.startswith("trail="):
+            try:
+                return float(token[6:])
+            except ValueError:
+                return None
+    return None
+
+
+def _with_trail(alerts: str, stop: float) -> str:
+    """The alerts column with the announced trailing stop replaced by this one."""
+    keep = [t for t in str(alerts).split(",") if t and not t.startswith("trail=")]
+    return ",".join(keep + [f"trail={stop:.2f}"])
+
+
+def _idea_for_trail(row, fill, peak_r, latest=None) -> dict:
+    return {"side": row["side"], "fill": float(fill), "risk": float(row["risk"]), "peak_r": peak_r,
+            "entry": float(row["entry"]), "target": float(row["target"]), "option_levels": _json(row["option_levels"], None),
+            "latest": latest}
+
+
+def update_results(f: pd.DataFrame, index: str, interval_min: int, on_finished=None, on_trail=None):
     """
     Check unfinished ideas against the finished candles in f (output of compute_features).
     on_finished: optional function(info) called ONCE for an idea that had an alert ("new") and has
     now ended (target / stop loss / time exit). info has the option, side, status, result in R, etc.
+    on_trail: optional function(info) called when a running idea that had an alert ("new") has a new trailing stop
+    (trailing_stop.py): advice to move the stop up, when it is at least Rs 3 above the last one announced (if the
+    price jumps, ONE message for the newest stop). Advice only: the result below keeps using the first stop.
     """
     new_experiences = []
     finished_alerts = []
+    trail_alerts = []
     with _lock:
         df = _load()
         open_rows = df[(df["index"] == index) & (df["interval"] == f"{interval_min}m")
@@ -239,6 +267,16 @@ def update_results(f: pd.DataFrame, index: str, interval_min: int, on_finished=N
                 continue
             df.loc[row_id, columns] = new_values
             changed = True
+
+            if res["status"] == "OPEN" and on_trail is not None and res["fill"] is not None and "new" in str(row["alerts"]):
+                adv = trailing_stop.advice(_idea_for_trail(row, res["fill"], res["peak_r"], float(f["close"].iloc[-1])))
+                last = _trail_done(row["alerts"])
+                old = last if last is not None else adv["first_stop_option"]
+                if trailing_stop.should_alert(adv, old):
+                    df.loc[row_id, "alerts"] = _with_trail(row["alerts"], adv["stop_option"])      # marked BEFORE sending
+                    trail_alerts.append({
+                        "key": row["key"], "index": row["index"], "interval": row["interval"], "side": row["side"],
+                        "option": row["option"], "advice": adv, "old_stop": old})
 
             if res["status"] in FINISHED:
                 alerts = str(row["alerts"])
@@ -272,6 +310,32 @@ def update_results(f: pd.DataFrame, index: str, interval_min: int, on_finished=N
             on_finished(info)
         except Exception as error:
             print(f"[journal] result alert failed: {error}")
+    for info in trail_alerts:
+        try:
+            on_trail(info)
+        except Exception as error:
+            print(f"[journal] stop advice alert failed: {error}")
+
+
+def open_ideas() -> list:
+    """Every running idea (entered, no result yet) with its trailing-stop advice, for the dashboard."""
+    with _lock:
+        df = _load()
+    out = []
+    for _, row in df[df["status"] == "OPEN"].iterrows():
+        fill, peak = _num(row["fill"]), _num(row["peak_r"])
+        if fill is None:
+            continue
+        try:
+            ts = pd.Timestamp(row["signal_time"])
+            adv = trailing_stop.advice(_idea_for_trail(row, fill, peak if peak is not None else 0.0))
+        except (ValueError, TypeError, KeyError):
+            continue
+        out.append({"key": row["key"], "time": ts.strftime("%H:%M"), "date": ts.strftime("%d %b"), "index": str(row["index"]).upper(),
+                    "interval": row["interval"], "side": row["side"], "option": row["option"], "fill": fill,
+                    "target": _num(row["target"]), "advice": adv})
+    out.sort(key=lambda x: x["key"], reverse=True)
+    return out
 
 
 def today_stats(day) -> dict:

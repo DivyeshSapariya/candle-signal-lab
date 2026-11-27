@@ -90,7 +90,7 @@ def main():
     import candle_journal as cj
     sent = []
     sc.tg.is_configured = lambda: True
-    sc.tg.send_message = lambda text: sent.append(text)
+    sc.tg.send_message = lambda text, **kw: sent.append(text)
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         cj.JOURNAL_FILE = os.path.join(tmp, "j.csv")
         db = os.path.join(tmp, "t.db")
@@ -118,10 +118,49 @@ def main():
         assert sc.run_auto(datetime(2026, 11, 26, 16, 0, tzinfo=IST), db, folder) and len(sent) == 3
         sc.tg.is_configured = lambda: True
 
-        def boom(text):
+        def boom(text, **kw):
             raise RuntimeError("no network")
         sc.tg.send_message = boom
         assert sc.run_auto(datetime(2026, 11, 30, 16, 0, tzinfo=IST), db, folder)
+
+    # --- the Telegram summary lists the day's ideas in RUPEES (not R) ---
+    import json
+    lv = json.dumps({"profit_per_unit": 98.6, "loss_per_unit": 42.05})
+    cols = ["signal_time", "index", "option", "interval", "status", "r", "note", "option_levels"]
+    rows = [
+        ["2026-11-25T10:00:00+05:30", "nifty", "NIFTY 25800 CE", "5m", "TARGET", "2.0", "", lv],
+        ["2026-11-25T11:00:00+05:30", "sensex", "SENSEX 84400 CE", "5m", "STOP", "-1.0", "", lv],
+        ["2026-11-25T12:00:00+05:30", "nifty", "NIFTY 25850 PE", "5m", "TIME", "0.6", "", lv],
+        ["2026-11-25T13:00:00+05:30", "nifty", "NIFTY 25800 CE", "5m", "OPEN", "", "", lv],
+        ["2026-11-25T13:30:00+05:30", "nifty", "NIFTY 25800 CE", "5m", "STOP", "-1.0", "", ""],
+        ["2026-11-25T14:00:00+05:30", "nifty", "NIFTY 25800 CE", "5m", "SKIPPED", "", "Daily limit: x", lv],
+        ["2026-11-24T10:00:00+05:30", "nifty", "NIFTY 25800 CE", "5m", "TARGET", "2.0", "", lv],        # another day
+    ]
+    sizes = lambda i: {"nifty": 65, "sensex": 20}[i]
+    off = {"capital": None, "risk_pct": None, "max_loss_r": None, "max_ideas": None}
+    money = sc.idea_money_lines(pd.DataFrame(rows, columns=cols), date(2026, 11, 25), sizes, off)
+    text = " | ".join(money)
+    assert len(money) == 6, text
+    assert "- 10:00 NIFTY 25800 CE 5m: PROFIT ₹6,409 Total(1 LOT)" in text, text
+    assert "- 11:00 SENSEX 84400 CE 5m: LOSS ₹841 Total(1 LOT)" in text, text
+    assert "12:00 NIFTY 25850 PE 5m: PROFIT about ₹1,923 Total(1 LOT)" in text and "13:00 NIFTY 25800 CE 5m: RUNNING" in text, text
+    assert "STOP (rupees not known" in text and "SKIPPED" not in text and "10:00 NIFTY 25800 CE 5m: PROFIT ₹6,409" in text
+    assert money[-1] == "Day total: PROFIT ₹7,491 (before brokerage and taxes)", money[-1]
+    # with the position-size helper: lots that fit the budget (loss per lot: NIFTY 2,733, SENSEX 841); at least 1
+    cfg = {"capital": 30000, "risk_pct": 6, "max_loss_r": None, "max_ideas": None}
+    sized = sc.idea_money_lines(pd.DataFrame(rows, columns=cols), date(2026, 11, 25), sizes, cfg)
+    assert "- 10:00 NIFTY 25800 CE 5m: PROFIT ₹6,409 Total(1 LOT)" in sized, sized          # budget 1,800 < 2,733: still 1
+    assert "- 11:00 SENSEX 84400 CE 5m: LOSS ₹1,682 Total(2 LOT)" in sized, sized          # 1,800 / 841 = 2 lots
+    assert sc.idea_money_lines(pd.DataFrame(columns=cols), date(2026, 11, 25)) == []
+    assert sc.idea_money_lines(pd.DataFrame(rows, columns=cols), date(2026, 12, 1)) == []
+    msg = sc.telegram_summary(date(2026, 11, 25), [("Journal", [("INFO", "Ideas: 1 stop")])], 0, money)
+    assert "Ideas in rupees:" in msg and "PROFIT" in msg and msg.index("Ideas: 1 stop") < msg.index("Ideas in rupees:") < msg.index("Nothing to check.")
+    hm = sc.telegram_summary(date(2026, 11, 25), [("Journal", [("INFO", "a < b")])], 0, money, as_html=True)
+    assert "🟢 <b>PROFIT ₹6,409</b> Total(1 LOT)" in hm and "🔴 <b>LOSS ₹841</b> Total(1 LOT)" in hm, hm
+    assert "<b>PROFIT about ₹1,923</b>" in hm and "<b>PROFIT ₹7,491</b> (before" in hm and "a &lt; b" in hm, "escaped, only the money is bold"
+    assert hm.count("<b>") == hm.count("</b>") == 4 and "RUNNING" in hm and "<b>RUNNING" not in hm
+    assert "<b>" not in msg, "the plain text has no markup"
+    assert "Ideas in rupees" not in sc.telegram_summary(date(2026, 11, 25), [("Journal", [("INFO", "x")])], 0), "unchanged without ideas"
 
     print("OK: trading day, data freshness, journal summary, saved-data and collection-run checks, automatic mode")
 

@@ -118,13 +118,42 @@ def _angel_login():
         raise RuntimeError(f"Set these environment variables first: {', '.join(missing)}")
 
     client = SmartConnect(api_key=os.environ["ANGEL_API_KEY"])
-    otp = pyotp.TOTP(os.environ["ANGEL_TOTP_SECRET"]).now()
-    session = client.generateSession(os.environ["ANGEL_CLIENT_ID"],
-                                     os.environ["ANGEL_PIN"], otp)
-    if not session or not session.get("status"):
-        raise RuntimeError(f"Angel One login failed: {session}")
+    _angel_generate_session(client)
     _angel_client = client
     return client
+
+
+def _angel_generate_session(client) -> None:
+    """Log in (or log in again) on this client with a fresh one-time code. Raises RuntimeError if Angel One refuses."""
+    import pyotp
+
+    otp = pyotp.TOTP(os.environ["ANGEL_TOTP_SECRET"]).now()
+    session = client.generateSession(os.environ["ANGEL_CLIENT_ID"], os.environ["ANGEL_PIN"], otp)
+    if not session or not session.get("status"):
+        raise RuntimeError(f"Angel One login failed: {session}")
+
+
+def angel_token_invalid(res=None, error=None) -> bool:
+    """True when Angel One says the login token is no longer valid (it expires every day, or when you log in elsewhere)."""
+    if error is not None:
+        text = str(error).lower()
+        return "invalid token" in text or "ag8001" in text or "ag8002" in text
+    return (isinstance(res, dict) and not res.get("status", res.get("success", True))
+            and (str(res.get("errorCode", res.get("errorcode", ""))).upper() in ("AG8001", "AG8002")
+                 or "invalid token" in str(res.get("message", "")).lower()))
+
+
+def _angel_relogin() -> bool:
+    """A fresh login on the SAME client object (every caller keeps using it). Returns False if it did not work."""
+    if _angel_client is None:
+        return False
+    try:
+        _angel_generate_session(_angel_client)
+        print("[angel] the login had expired: logged in again")
+        return True
+    except Exception as error:
+        print(f"[angel] could not log in again: {error}")
+        return False
 
 
 ANGEL_CALL_GAP_SECONDS = 2.0        # Angel One refuses requests that come too fast
@@ -181,6 +210,7 @@ def _angel_request(call):
     try:
         with _angel_lock:
             waits = ANGEL_RETRY_WAITS[:1] if low else ANGEL_RETRY_WAITS     # background work gives up early and tries again later
+            relogged = False
             for attempt in range(len(waits) + 1):
                 wait = ANGEL_CALL_GAP_SECONDS - (time.time() - _angel_last_call[0])
                 if wait > 0:
@@ -190,6 +220,10 @@ def _angel_request(call):
                 began = time.time()
                 try:
                     res = call()
+                    if angel_token_invalid(res=res) and not relogged:
+                        relogged = True
+                        if _angel_relogin():
+                            res = call()                            # once more with the fresh token
                     if not angel_too_fast(res=res):
                         angel_recent.append([round(began % 1000, 1), "ok", round(time.time() - began, 2), "bg" if low else "page"])
                         del angel_recent[:-40]
@@ -197,6 +231,10 @@ def _angel_request(call):
                     error = RuntimeError(str(res))
                 except Exception as raised:
                     error = raised
+                    if angel_token_invalid(error=raised) and not relogged:
+                        relogged = True
+                        if _angel_relogin():
+                            continue
                     if not angel_too_fast(error=raised):
                         raise
                 angel_recent.append([round(began % 1000, 1), "LIMITED", round(time.time() - began, 2), "bg" if low else "page"])
